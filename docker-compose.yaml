@@ -3,16 +3,8 @@ services:
     build: .
     ports:
       - "8000:8000"
-    environment:
-      MODEL_DIR: /models/embeddinggemma2
-      JPEG_DIR: /data/jpegs
-      EMB_FILE: /data/embeddings.npz
-      CONTRASTIVE_EMB_FILE: /data/contrastive_embeddings.npz
-      META_FILE: /data/convert_results.jsonl
     volumes:
-      - "C:/Users/JAYANTA/Desktop/LLM_Work/models/embeddinggemma2:/models/embeddinggemma2:ro"
-      - "C:/Users/JAYANTA/Desktop/PythonCases/jpegs:/data/jpegs:ro"
-      - "C:/Users/JAYANTA/Desktop/PythonCases/embeddings.npz:/data/embeddings.npz:ro"
-      - "C:/Users/JAYANTA/Desktop/PythonCases/contrastive_embeddings.npz:/data/contrastive_embeddings.npz"
-      - "C:/Users/JAYANTA/Desktop/PythonCases/convert_results.jsonl:/data/convert_results.jsonl:ro"
+      - /opt/semantic-search/model/embeddinggemma2:/opt/semantic-search/model/embeddinggemma2:ro
+      - /opt/semantic-search/PythonSemanticSearch/embeddings.npz:/app/embeddings.npz:ro
+      - /opt/semantic-search/PythonSemanticSearch/convert_results.jsonl:/app/convert_results.jsonl:ro
     restart: unless-stopped
