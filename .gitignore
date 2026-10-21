@@ -1,0 +1,26 @@
+# Ignore image dataset contents, but keep the folders
+jpegs/*
+!jpegs/.gitkeep
+
+# Ignore generated shards, but keep the folder
+shards/*
+!shards/.gitkeep
+
+# Ignore embedding arrays EXCEPT embeddings.npz
+*.npz
+# !embeddings.npz
+# !contrastive_embeddings.npz
+
+# Generated processing data
+convert_results.jsonl
+inventory.jsonl
+manifest.jsonl
+manifest.prev.jsonl
+dropped.jsonl
+
+# Scan outputs
+scan_changes.jsonl
+scan_summary.json
+
+# Editor settings
+.vscode/
