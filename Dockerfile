@@ -9,7 +9,7 @@ ENV TRANSFORMERS_OFFLINE=1
 COPY requirements.txt .
 
 # Install CPU-only PyTorch
-RUN pip install --no-cache-dir torch \
+RUN pip install --no-cache-dir torch torchvision \
     --index-url https://download.pytorch.org/whl/cpu
 
 # Install remaining dependencies

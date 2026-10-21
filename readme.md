@@ -50,3 +50,6 @@ mkdir -p model
 git clone https://github.com/Sbiswas3011/PythonSemanticSearch.git
 
 cd PythonSemanticSearch
+
+sudo docker compose logs -f
+sudo docker compose ps

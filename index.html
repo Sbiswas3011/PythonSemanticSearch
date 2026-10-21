@@ -180,7 +180,8 @@
 <!-- <div id="lightbox"><img id="big"><div class="cap" id="cap"></div></div> -->
  
 <script>
-const API_BASE = "https://YOUR-BACKEND-URL";
+const API_BASE = "https://3.7.46.165:8000";
+const apiUrl = path => `${API_BASE}${path}`;
 const grid = document.getElementById("grid");
 const statusEl = document.getElementById("status");
 const moreBtn = document.getElementById("more");
@@ -203,7 +204,8 @@ function addCard(r) {
  
   const im = document.createElement("img");
   im.loading = "lazy";
-  im.src = "/img/" + encodeURIComponent(r.id);
+  // im.src = "/img/" + encodeURIComponent(r.id);
+  im.src = apiUrl("/img/" + encodeURIComponent(r.id));
   card.appendChild(im);
  
   const info = document.createElement("div");
@@ -231,7 +233,7 @@ async function load() {
   moreBtn.disabled = true;
   statusEl.textContent = offset === 0 ? "Searching..." : statusEl.textContent;
   try {
-    const res = await fetch("/search?q=" + encodeURIComponent(query) + "&offset=" + offset);
+    const res = await fetch(apiUrl("/search?q=" + encodeURIComponent(query) + "&offset=" + offset));
     const data = await res.json();
     total = data.total;
     data.results.forEach(addCard);
@@ -269,8 +271,7 @@ const box = document.getElementById("lightbox");
 function openBox(r) {
   selectedImage = r;
 
-  document.getElementById("big").src =
-    "/img/" + encodeURIComponent(r.id);
+  document.getElementById("big").src = apiUrl("/img/" + encodeURIComponent(r.id));
 
   document.getElementById("cap").textContent =
     r.id + "   " + r.raw_path;
@@ -311,7 +312,7 @@ document.getElementById("correction-form").addEventListener(
     };
 
     try {
-      const res = await fetch("/correct", {
+      const res = await fetch(apiUrl("/correct"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
