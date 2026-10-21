@@ -1,0 +1,7 @@
+Flask
+Flask-Cors
+numpy
+sentence-transformers
+torch
+gunicorn
+boto3

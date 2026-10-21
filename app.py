@@ -2,13 +2,16 @@ import json
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from flask import send_from_directory
+from flask import send_from_directory, redirect, abort
 import numpy as np
 from flask import Flask, Response, abort, jsonify, request, send_from_directory
 from sentence_transformers import SentenceTransformer
 import torch
 import torch.nn.functional as F
 import re, os
+from flask_cors import CORS
+from botocore.exceptions import ClientError
+import boto3
  
 # ---------- settings ----------
 BASE = Path(__file__).parent
@@ -20,7 +23,16 @@ META_FILE = BASE / "convert_results.jsonl"
 DIM = 768      # must match the DIM used when embedding
 PAGE = 24      # results per page
 # ------------------------------
- 
+
+S3_BUCKET = os.environ.get(
+    "S3_BUCKET", "thumbnail-s3-semanticsearch"
+)
+S3_PREFIX = os.environ.get("S3_PREFIX", "jpegs").strip("/")
+
+AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
+
+s3 = boto3.client("s3", region_name=AWS_REGION)
+
 print("Loading model...", flush=True)
 model = SentenceTransformer(MODEL_DIR, config_kwargs={"audio_config": None})
  
@@ -47,6 +59,13 @@ with open(META_FILE, encoding="utf-8") as f:
 print(f"{len(ids)} images loaded.", flush=True)
  
 app = Flask(__name__)
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "https://sbiswas3011.github.io"
+        ]
+    }
+})
 lock = threading.Lock()          # the model isn't safe to call from several threads at once
 cache = OrderedDict()            # query -> (order, scores), keeps the last 20 queries
 
@@ -209,13 +228,38 @@ def search():
     return jsonify(total=len(order), results=results)
  
  
+# @app.route("/img/<path:rid>")
+# def img(rid):
+#     # send_from_directory blocks paths that try to escape JPEG_DIR
+#     p = JPEG_DIR / (rid + ".jpg")
+#     if not p.exists():
+#         abort(404)
+#     return send_from_directory(JPEG_DIR, rid + ".jpg")
+
 @app.route("/img/<path:rid>")
 def img(rid):
-    # send_from_directory blocks paths that try to escape JPEG_DIR
-    p = JPEG_DIR / (rid + ".jpg")
-    if not p.exists():
+    # Uploaded filenames are based on IDs without ".jpg".
+    # Reject path traversal and unexpected characters.
+    # s3 routing handling
+    if "/" in rid or "\\" in rid or not rid:
         abort(404)
-    return send_from_directory(JPEG_DIR, rid + ".jpg")
+
+    key = f"{S3_PREFIX}/{rid}.jpg"
+
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": S3_BUCKET,
+                "Key": key,
+            },
+            ExpiresIn=3600,
+        )
+        return redirect(url)
+
+    except ClientError:
+        app.logger.exception("Could not generate S3 image URL")
+        abort(502)
 
 @app.route("/correct", methods=["POST"])
 def correct_image():

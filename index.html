@@ -180,6 +180,7 @@
 <!-- <div id="lightbox"><img id="big"><div class="cap" id="cap"></div></div> -->
  
 <script>
+const API_BASE = "https://YOUR-BACKEND-URL";
 const grid = document.getElementById("grid");
 const statusEl = document.getElementById("status");
 const moreBtn = document.getElementById("more");
@@ -265,7 +266,6 @@ const box = document.getElementById("lightbox");
 //   box.style.display = "flex";
 // }
 
-
 function openBox(r) {
   selectedImage = r;
 
@@ -280,6 +280,7 @@ function openBox(r) {
 
   box.style.display = "flex";
 }
+
 document.getElementById("correction-form").addEventListener(
   "submit",
   async e => {
