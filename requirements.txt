@@ -2,6 +2,6 @@ Flask
 Flask-Cors
 numpy
 sentence-transformers
-torch
+# torch
 gunicorn
 boto3
