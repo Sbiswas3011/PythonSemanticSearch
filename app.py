@@ -72,7 +72,7 @@ app = Flask(__name__)
 CORS(app, resources={
     r"/*": {
         "origins": [
-            "https://sbiswas3011.github.io",
+            "https://sbiswas3011.github.io/PythonSemanticSearch",
             "http://localhost:5173"
         ]
     }
