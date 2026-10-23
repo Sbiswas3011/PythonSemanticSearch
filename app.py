@@ -15,10 +15,10 @@ import boto3
  
 # ---------- settings ----------
 BASE = Path(__file__).parent
-# MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
-# JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs")
-MODEL_DIR = "/opt/semantic-search/model/embeddinggemma2"
-JPEG_DIR = BASE / "jpegs"
+MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
+JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs")
+# MODEL_DIR = "/opt/semantic-search/model/embeddinggemma2"
+# JPEG_DIR = BASE / "jpegs"
 EMB_FILE = BASE / "embeddings.npz"
 CONTRASTIVE_EMB_FILE = BASE / "contrastive_embeddings.npz"
 META_FILE = BASE / "convert_results.jsonl"
@@ -37,7 +37,7 @@ AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 print("Loading model...", flush=True)
-model = SentenceTransformer(MODEL_DIR, config_kwargs={"audio_config": None})
+model = SentenceTransformer(MODEL_DIR, device="cpu", config_kwargs={"audio_config": None, "vision_config": None})
  
 data = np.load(EMB_FILE)
 ids, vecs = data["ids"], data["vectors"]
@@ -65,7 +65,8 @@ app = Flask(__name__)
 CORS(app, resources={
     r"/*": {
         "origins": [
-            "https://sbiswas3011.github.io"
+            "https://sbiswas3011.github.io",
+            "http://localhost:5173"
         ]
     }
 })
@@ -282,6 +283,12 @@ def correct_image():
 
         if not isinstance(correct_text, str) or not correct_text.strip():
             raise ValueError("Invalid correct concept")
+
+        if "+" in wrong_text or "-" in wrong_text:
+            raise ValueError("Wrong text cannot contain '+' or '-' characters")
+        
+        if "+" in correct_text or "-" in correct_text:
+            raise ValueError("Correct text cannot contain '+' or '-' characters")
 
         if not 0 <= index < len(vecs):
             return jsonify(error="Invalid embedding index"), 400

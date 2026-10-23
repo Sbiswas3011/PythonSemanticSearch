@@ -53,3 +53,4 @@ cd PythonSemanticSearch
 
 sudo docker compose logs -f
 sudo docker compose ps
+VITE_API_BASE=https://your-api.example.com npm run build
