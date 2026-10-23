@@ -15,10 +15,17 @@ import boto3
  
 # ---------- settings ----------
 BASE = Path(__file__).parent
-MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
-JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs")
+# MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
+# JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs")
 # MODEL_DIR = "/opt/semantic-search/model/embeddinggemma2"
 # JPEG_DIR = BASE / "jpegs"
+
+if os.name == "nt":   # your Windows machine
+    MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
+    JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs")
+else:                 # Linux server / Docker
+    MODEL_DIR = "/opt/semantic-search/model/embeddinggemma2"
+    JPEG_DIR = BASE / "jpegs"
 EMB_FILE = BASE / "embeddings.npz"
 CONTRASTIVE_EMB_FILE = BASE / "contrastive_embeddings.npz"
 META_FILE = BASE / "convert_results.jsonl"
