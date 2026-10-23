@@ -230,15 +230,6 @@ def search():
             "raw_path": r.get("used", ""),
         })
     return jsonify(total=len(order), results=results)
- 
- 
-# @app.route("/img/<path:rid>")
-# def img(rid):
-#     # send_from_directory blocks paths that try to escape JPEG_DIR
-#     p = JPEG_DIR / (rid + ".jpg")
-#     if not p.exists():
-#         abort(404)
-#     return send_from_directory(JPEG_DIR, rid + ".jpg")
 
 @app.route("/img/<path:rid>")
 def img(rid):

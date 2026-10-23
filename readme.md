@@ -3,8 +3,7 @@ Basic Commands: to load local files into server
 $KEY = "$env:USERPROFILE\Documents\SS_Instance_medium.pem"
 $IP = "YOUR_NEW_EC2_PUBLIC_IP"
 
-scp -i $KEY -r `"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2" `
-"ubuntu@${IP}:/opt/semantic-search/model/"
+scp -i $KEY -r "C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2" "ubuntu@${IP}:/opt/semantic-search/model/"
 
 scp -i $KEY `
   "C:\Users\JAYANTA\Desktop\PythonCases\embeddings.npz" `
@@ -51,6 +50,7 @@ git clone https://github.com/Sbiswas3011/PythonSemanticSearch.git
 
 cd PythonSemanticSearch
 
+sudo docker compose up --build -d
 sudo docker compose logs -f
 sudo docker compose ps
 VITE_API_BASE=https://your-api.example.com npm run build
