@@ -1,6 +1,5 @@
 import json
 import numpy as np
-import torch
 from sentence_transformers import SentenceTransformer
 
 MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
