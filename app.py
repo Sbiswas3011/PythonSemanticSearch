@@ -1,4 +1,5 @@
 import json
+import pyOpenssl
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -331,4 +332,4 @@ if __name__ == "__main__":
     # 127.0.0.1 = reachable only from this computer
     # use_reloader=False so the model isn't loaded twice
     # app.run(host="127.0.0.1", port=8080, debug=False, use_reloader=False)
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    app.run(host="0.0.0.0", port=8000, debug=False, ssl_context='adhoc')

@@ -3,6 +3,7 @@ Flask-Cors
 numpy
 sentence-transformers
 # torch
+pyOpenSSL
 gunicorn
 boto3
 pillow
