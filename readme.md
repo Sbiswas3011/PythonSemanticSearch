@@ -54,3 +54,6 @@ sudo docker compose up --build -d
 sudo docker compose logs -f
 sudo docker compose ps
 VITE_API_BASE=https://your-api.example.com npm run build
+
+openssl req -x509 -newkey rsa:2048 -nodes -days 365   -keyout certs/key.pem -out certs/cert.pem -subj "/CN=localhost"
+- /opt/semantic-search/PythonSemanticSearch/certs:/certs:ro
