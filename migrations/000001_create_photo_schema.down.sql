@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS scan_events;
+DROP TABLE IF EXISTS scan_runs;
+DROP TABLE IF EXISTS photo_paths;
+DROP TABLE IF EXISTS photos;

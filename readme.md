@@ -57,3 +57,11 @@ VITE_API_BASE=https://your-api.example.com npm run build
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 365   -keyout certs/key.pem -out certs/cert.pem -subj "/CN=localhost"
 - /opt/semantic-search/PythonSemanticSearch/certs:/certs:ro
+
+psql -U postgres -h localhost
+
+migrate create -ext sql -dir migrations -seq create_photo_schema
+
+migrate -path migrations -database "$DB" up
+
+migrate -path migrations -database "$DB" down 1
