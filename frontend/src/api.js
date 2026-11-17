@@ -21,3 +21,20 @@ export async function correctEmbedding(payload) {
   if (!res.ok) throw new Error(data.error || "Correction failed");
   return data;
 }
+
+export async function searchPhotosByImage(file, offset = 0) {
+  const formData = new FormData();
+  formData.append("image", file);
+  formData.append("offset", offset);
+
+  const response = await fetch(`${API_BASE}/search`, {
+    method: "POST",
+    body: formData
+  });
+
+  if (!response.ok) {
+    throw new Error("Image search failed");
+  }
+
+  return response.json();
+}

@@ -1,515 +1,264 @@
 import os
-import hashlib
+import re
+import subprocess
 import time
-from pathlib import Path
+import uuid
 from collections import Counter
-from contextlib import closing
 
 import psycopg
-from psycopg.types.json import Jsonb
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
-
 load_dotenv()
-
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-SOURCES = ["C:/", "D:/", "E:/", "F:/", "G:/", "H:/", "I:/"]
-SOURCES = ["E:/"]
+SOURCE = "I:/"
+OUT_FILE = "C:/Users/JAYANTA/Desktop/PythonCases/ids.txt"
+ERR_FILE = "C:/Users/JAYANTA/Desktop/PythonCases/errors.txt"
 
-RAW_EXTS = {".cr2", ".cr3"}
-EXTS = RAW_EXTS | {".jpg", ".jpeg", ".png"}
+BATCH_SIZE = 500
+IDLE_WAIT = 2          # seconds to wait when the file has no new data
+NS = uuid.UUID("6f1c0d2e-0000-4000-8000-000000000001")  # never change this once used
 
-SKIP_DIRS = {
-    "$recycle.bin",
-    "system volume information",
-}
-
-MIN_NONRAW_BYTES = 100_000
-
-HASH_CHUNK_SIZE = 4 * 1024 * 1024
-DB_BATCH_SIZE = 500
-
-# Set True to rehash every file, even when size and mtime are unchanged.
-FORCE_REHASH = False
+FIELDS = ["$Directory/$FileName", "$Model", "$SerialNumber", "$ImageUniqueID",
+          "$LensSerialNumber", "$SubSecDateTimeOriginal", "$OriginalDocumentID",
+          "$DocumentID", "$InstanceID"]
+CMD = ["exiftool", "-r",
+       "-ext", "jpg", "-ext", "jpeg", "-ext", "cr2", "-ext", "cr3",
+       "-i", "$RECYCLE.BIN", "-i", "System Volume Information",
+       "-q", "-f", "-p", "|".join(FIELDS), SOURCE]
 
 
 # ---------------------------------------------------------
-# FILE HELPERS
+# PARSING
 # ---------------------------------------------------------
 
-def drive_of(path):
-    return os.path.splitdrive(path)[0].upper()
+def clean(v):
+    v = v.strip()
+    return None if v in ("", "-") else v
 
 
-def path_key(path):
-    # Windows paths are case-insensitive.
-    return os.path.normcase(os.path.normpath(path))
+def build_row(line, run_id):
+    parts = line.rstrip("\r").rsplit("|", 8)    # path may itself contain '|'
+    if len(parts) != 9:
+        return None
+    path, _model, serial, uid, _lens, subsec_dt, _orig, _doc, inst = parts
+    path = path.strip()
+    if not path:
+        return None
 
+    serial, uid, subsec_dt, inst = map(clean, (serial, uid, subsec_dt, inst))
+    if uid and re.fullmatch(r"0+", uid):
+        uid = None
 
-def hash_file(path):
-    digest = hashlib.sha256()
+    subsec_key = None
+    if serial and subsec_dt:
+        dt = re.sub(r"(Z|[+-]\d\d:\d\d)$", "", subsec_dt)   # drop timezone offset
+        if re.search(r"\.\d+$", dt):                         # must include subseconds
+            subsec_key = f"{serial}|{dt}"
 
-    with open(path, "rb") as f:
-        while chunk := f.read(HASH_CHUNK_SIZE):
-            digest.update(chunk)
+    if subsec_key:
+        capture_key = "subsec:" + subsec_key
+    elif uid:
+        capture_key = "uuid:" + uid
+    else:
+        capture_key = None
 
-    return digest.hexdigest()
-
-
-def iter_files(root, errors):
-    stack = [os.path.normpath(str(root))]
-
-    while stack:
-        directory = stack.pop()
-
-        try:
-            entries = os.scandir(directory)
-        except OSError:
-            errors["directory_errors"] += 1
-            continue
-
-        with entries:
-            for entry in entries:
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name.lower() in SKIP_DIRS:
-                            continue
-
-                        # Avoid junctions and directory loops.
-                        is_junction = getattr(entry, "is_junction", None)
-                        if is_junction and is_junction():
-                            continue
-
-                        stack.append(entry.path)
-
-                    elif entry.is_file(follow_symlinks=False):
-                        yield entry
-
-                except OSError:
-                    errors["entry_errors"] += 1
+    return {
+        "path": path,
+        "shot_id": uuid.uuid5(NS, capture_key) if capture_key else None,
+        "capture_key": capture_key,
+        "cam_uuid": uid,
+        "subsec_key": subsec_key,
+        "instance_id": inst,
+        "run_id": run_id,
+    }
 
 
 # ---------------------------------------------------------
-# DATABASE HELPERS
+# TAIL THE OUTPUT FILE
 # ---------------------------------------------------------
 
-def insert_event(cur, run_id, event, **kwargs):
-    cur.execute(
-        """
-        INSERT INTO scan_events (
-            run_id, event, old_sha256, new_sha256,
-            old_path, new_path, data
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            run_id,
-            event,
-            kwargs.get("old_sha256"),
-            kwargs.get("new_sha256"),
-            kwargs.get("old_path"),
-            kwargs.get("new_path"),
-            Jsonb(kwargs.get("data", {})),
-        ),
-    )
+def tail_lines(proc):
+    """Yield complete lines as exiftool writes them. Yields None when idle.
+    Returns only after exiftool has exited AND the file is fully read."""
+    buf = ""
+    with open(OUT_FILE, "r", encoding="utf-8", errors="replace", newline="") as f:
+        while True:
+            exited = proc.poll() is not None     # check BEFORE reading (avoids a race)
+            chunk = f.read(1 << 20)
+            if chunk:
+                buf += chunk
+                *lines, buf = buf.split("\n")    # last piece may be a half-written line
+                yield from lines
+            elif exited:
+                break                            # exited and nothing left to read
+            else:
+                yield None                       # idle: caller can flush its batch
+                time.sleep(IDLE_WAIT)
+        if buf.strip():
+            yield buf                            # final line with no trailing newline
 
 
-def flush_batch(cur, batch):
+# ---------------------------------------------------------
+# DATABASE
+# ---------------------------------------------------------
+
+def flush(cur, batch, run_id, first_run, counts):
     if not batch:
         return
+    rows = list(batch.values())
+
+    cur.execute("SELECT path, instance_id, status FROM files WHERE path = ANY(%s)",
+                ([r["path"] for r in rows],))
+    old = {p: (inst, st) for p, inst, st in cur.fetchall()}
+
+    shots = {r["shot_id"]: r for r in rows if r["shot_id"]}.values()
+    cur.executemany(
+        """INSERT INTO shots (shot_id, capture_key, cam_uuid, subsec_key)
+           VALUES (%(shot_id)s, %(capture_key)s, %(cam_uuid)s, %(subsec_key)s)
+           ON CONFLICT (capture_key) DO UPDATE SET
+               cam_uuid   = COALESCE(shots.cam_uuid,   EXCLUDED.cam_uuid),
+               subsec_key = COALESCE(shots.subsec_key, EXCLUDED.subsec_key)""",
+        list(shots))
+
+    events = []
+    for r in rows:
+        o = old.get(r["path"])
+        if o is None:
+            ev = "new"
+        elif o[0] and r["instance_id"] and o[0] != r["instance_id"]:
+            ev = "modified"
+        elif o[1] == "missing":
+            ev = "reappeared"
+        else:
+            ev = None
+        if ev:
+            counts[ev] += 1
+            if not (first_run and ev == "new"):
+                events.append((run_id, ev, r["shot_id"], None, r["path"]))
+
+    if events:
+        cur.executemany(
+            """INSERT INTO scan_events (run_id, event, shot_id, old_path, new_path)
+               VALUES (%s, %s, %s, %s, %s)""", events)
 
     cur.executemany(
-        """
-        INSERT INTO photo_paths (
-            path_key, path, drive, stem, ext,
-            sha256, size, mtime_ns,
-            status, first_seen, last_seen, last_seen_run_id
-        )
-        VALUES (
-            %(path_key)s, %(path)s, %(drive)s, %(stem)s, %(ext)s,
-            %(sha256)s, %(size)s, %(mtime_ns)s,
-            'present', NOW(), NOW(), %(run_id)s
-        )
-        ON CONFLICT (path_key)
-        DO UPDATE SET
-            path = EXCLUDED.path,
-            drive = EXCLUDED.drive,
-            stem = EXCLUDED.stem,
-            ext = EXCLUDED.ext,
-            sha256 = EXCLUDED.sha256,
-            size = EXCLUDED.size,
-            mtime_ns = EXCLUDED.mtime_ns,
-            status = 'present',
-            last_seen = NOW(),
-            last_seen_run_id = EXCLUDED.last_seen_run_id,
-            missing_since = NULL
-        """,
-        batch,
-    )
-
+        """INSERT INTO files (path, shot_id, instance_id, status,
+                              first_seen, last_seen, last_seen_run_id)
+           VALUES (%(path)s, %(shot_id)s, %(instance_id)s, 'present',
+                   NOW(), NOW(), %(run_id)s)
+           ON CONFLICT (path) DO UPDATE SET
+               shot_id = EXCLUDED.shot_id,
+               instance_id = EXCLUDED.instance_id,
+               status = 'present',
+               last_seen = NOW(),
+               last_seen_run_id = EXCLUDED.last_seen_run_id,
+               missing_since = NULL""",
+        rows)
     batch.clear()
 
 
+def mark_missing_and_moved(cur, run_id, counts):
+    cur.execute(
+        """UPDATE files
+           SET status = 'missing', missing_since = COALESCE(missing_since, NOW())
+           WHERE status = 'present'
+             AND starts_with(path, %s)
+             AND last_seen_run_id IS DISTINCT FROM %s
+           RETURNING path, shot_id""",
+        (SOURCE, run_id))
+    missing = cur.fetchall()
+    counts["missing"] = len(missing)
+    if missing:
+        cur.executemany(
+            """INSERT INTO scan_events (run_id, event, shot_id, old_path)
+               VALUES (%s, 'missing', %s, %s)""",
+            [(run_id, sid, p) for p, sid in missing])
+
+    # moved = a path went missing and a new path with the same shot + file name appeared
+    cur.execute(
+        r"""INSERT INTO scan_events (run_id, event, shot_id, old_path, new_path)
+            SELECT %(r)s, 'moved', n.shot_id, m.old_path, n.new_path
+            FROM scan_events n
+            JOIN scan_events m
+              ON m.run_id = n.run_id AND m.shot_id = n.shot_id
+             AND lower(substring(m.old_path from '[^/]+$'))
+               = lower(substring(n.new_path from '[^/]+$'))
+            WHERE n.run_id = %(r)s AND n.event = 'new' AND m.event = 'missing'""",
+        {"r": run_id})
+    counts["moved"] = cur.rowcount
+
+
 # ---------------------------------------------------------
-# MAIN SCANNER
+# MAIN
 # ---------------------------------------------------------
 
-def scan_photos(sources=SOURCES):
+def main():
+    global SOURCE
+    SOURCE = SOURCE.replace("\\", "/")
+    if not SOURCE.endswith("/"):
+        SOURCE += "/"
+    if not os.path.exists(SOURCE):
+        print(f"{SOURCE} not found, nothing scanned.")
+        return
 
-    started = time.time()
-    errors = Counter()
     counts = Counter()
+    interrupted = False
+
+    with psycopg.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+        cur.execute("SELECT EXISTS (SELECT 1 FROM files)")
+        first_run = not cur.fetchone()[0]
+        cur.execute("INSERT INTO scan_runs DEFAULT VALUES RETURNING id")
+        run_id = cur.fetchone()[0]
+        conn.commit()
+
+        out, err = open(OUT_FILE, "wb"), open(ERR_FILE, "wb")   # truncates old output
+        proc = subprocess.Popen(CMD, stdout=out, stderr=err)
+        out.close(); err.close()
+
+        batch = {}
+        try:
+            with tqdm(unit=" rows") as bar:
+                for line in tail_lines(proc):
+                    if line is None:                        # idle: push what we have
+                        flush(cur, batch, run_id, first_run, counts)
+                        conn.commit()
+                        continue
+                    if not line.strip():
+                        continue
+                    row = build_row(line, run_id)
+                    if row is None:
+                        counts["bad_lines"] += 1
+                        continue
+                    batch[row["path"]] = row
+                    counts["rows"] += 1
+                    bar.update(1)
+                    if len(batch) >= BATCH_SIZE:
+                        flush(cur, batch, run_id, first_run, counts)
+                        conn.commit()
+        except KeyboardInterrupt:
+            interrupted = True
+            proc.terminate()
+            print("\nInterrupted; saving what was read.")
+
+        flush(cur, batch, run_id, first_run, counts)
+        conn.commit()
+
+        ok = not interrupted and counts["rows"] > 0
+        if ok:
+            mark_missing_and_moved(cur, run_id, counts)
+
+        cur.execute("UPDATE scan_runs SET finished_at = NOW(), status = %s WHERE id = %s",
+                    ("done" if ok else "failed", run_id))
+        conn.commit()
+
+    print(f"\nRun {run_id}: {'done' if ok else 'FAILED'} | exiftool exit code: {proc.returncode}")
+    for k, v in sorted(counts.items()):
+        print(f"  {k}: {v:,}")
+    if counts["rows"] == 0:
+        print(f"No rows were read, so nothing was marked missing. Check {ERR_FILE}")
 
-    with psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-
-            # Start scan run.
-            cur.execute(
-                "INSERT INTO scan_runs DEFAULT VALUES RETURNING id"
-            )
-            run_id = cur.fetchone()[0]
-
-            conn.commit()
-
-            # Load known paths and hashes.
-            print("Loading existing database records...")
-
-            cur.execute(
-                """
-                SELECT path_key, path, drive, sha256,
-                       size, mtime_ns, status
-                FROM photo_paths
-                """
-            )
-
-            existing = {}
-
-            for row in cur.fetchall():
-                existing[row[0]] = {
-                    "path": row[1],
-                    "drive": row[2],
-                    "sha256": row[3].strip(),
-                    "size": row[4],
-                    "mtime_ns": row[5],
-                    "status": row[6],
-                }
-
-            cur.execute("SELECT sha256 FROM photos")
-            known_hashes = {row[0].strip() for row in cur.fetchall()}
-
-            first_run = not existing
-
-            print(
-                f"Loaded {len(existing):,} paths and "
-                f"{len(known_hashes):,} unique file hashes."
-            )
-
-            # Drives whose scans completed successfully.
-            scanned_drives = set()
-
-            # Track every path found during this run.
-            found_keys = set()
-
-            # Buffer database writes.
-            batch = []
-
-            for source in sources:
-                root = Path(source)
-                drive = root.drive.upper()
-
-                if not root.exists():
-                    tqdm.write(f"[SKIP] {source} not found; leaving unchanged.")
-                    continue
-
-                drive_start = time.time()
-                drive_errors_before = sum(errors.values())
-                found_count = 0
-                processed_count = 0
-
-                tqdm.write(f"\n[START] Scanning {source}")
-
-                with tqdm(
-                    desc=source,
-                    unit=" files",
-                    leave=True,
-                ) as bar:
-
-                    for entry in iter_files(root, errors):
-
-                        ext = Path(entry.name).suffix.lower()
-
-                        if ext not in EXTS:
-                            continue
-
-                        try:
-                            stat = entry.stat(follow_symlinks=False)
-                        except OSError as e:
-                            errors["stat_errors"] += 1
-                            continue
-
-                        size = stat.st_size
-
-                        if size == 0:
-                            counts["zero_bytes"] += 1
-                            continue
-
-                        if ext not in RAW_EXTS and size < MIN_NONRAW_BYTES:
-                            counts["small_nonraw"] += 1
-                            continue
-
-                        path = os.path.normpath(entry.path)
-                        key = path_key(path)
-
-                        if key in found_keys:
-                            continue
-
-                        found_keys.add(key)
-                        found_count += 1
-                        bar.update(1)
-
-                        mtime_ns = stat.st_mtime_ns
-                        old = existing.get(key)
-
-                        # Check whether the file is unchanged.
-                        unchanged = (
-                            old is not None
-                            and old["size"] == size
-                            and old["mtime_ns"] == mtime_ns
-                            and not FORCE_REHASH
-                        )
-
-                        if unchanged:
-                            sha256 = old["sha256"]
-                            counts["hash_skipped"] += 1
-
-                        else:
-                            try:
-                                sha256 = hash_file(path)
-                            except OSError as e:
-                                errors["hash_errors"] += 1
-                                found_keys.discard(key)
-
-                                tqdm.write(f"[HASH ERROR] {path}: {e}")
-                                continue
-
-                            counts["hashed"] += 1
-
-                        # Check whether this content existed before this discovery.
-                        was_known = sha256 in known_hashes
-
-                        # Insert new content if necessary.
-                        if not was_known:
-                            cur.execute(
-                                """
-                                INSERT INTO photos (sha256, size)
-                                VALUES (%s, %s)
-                                ON CONFLICT (sha256) DO NOTHING
-                                """,
-                                (sha256, size),
-                            )
-
-                            known_hashes.add(sha256)
-                            counts["new_content"] += 1
-
-                        # Detect modified files.
-                        if old is not None and old["sha256"] != sha256:
-                            counts["modified"] += 1
-
-                            tqdm.write(
-                                f"[MODIFIED] {path}: "
-                                f"{old['sha256'][:12]} -> {sha256[:12]}"
-                            )
-
-                            if not first_run:
-                                insert_event(
-                                    cur,
-                                    run_id,
-                                    "modified",
-                                    old_sha256=old["sha256"],
-                                    new_sha256=sha256,
-                                    old_path=old["path"],
-                                    new_path=path,
-                                    data={
-                                        "old_size": old["size"],
-                                        "new_size": size,
-                                    },
-                                )
-
-                        # Detect new paths.
-                        elif old is None:
-                            counts["new_paths"] += 1
-
-                            if was_known and not first_run:
-                                tqdm.write(f"[PATH ADDED] {path}")
-
-                                insert_event(
-                                    cur,
-                                    run_id,
-                                    "path_added",
-                                    new_sha256=sha256,
-                                    new_path=path,
-                                )
-
-                        # ALWAYS queue the path, whether new, modified or unchanged.
-                        batch.append({
-                            "path_key": key,
-                            "path": path,
-                            "drive": drive,
-                            "stem": Path(entry.name).stem.lower(),
-                            "ext": ext,
-                            "sha256": sha256,
-                            "size": size,
-                            "mtime_ns": mtime_ns,
-                            "run_id": run_id,
-                        })
-
-                        processed_count += 1
-
-                        # Flush database batch.
-                        if len(batch) >= DB_BATCH_SIZE:
-                            batch_size = len(batch)
-
-                            flush_batch(cur, batch)
-                            conn.commit()
-
-                            tqdm.write(
-                                f"[DB COMMIT] {drive} | "
-                                f"{batch_size:,} paths committed | "
-                                f"Processed: {processed_count:,}"
-                            )
-
-                # Flush remaining records after finishing this drive.
-                if batch:
-                    batch_size = len(batch)
-
-                    flush_batch(cur, batch)
-                    conn.commit()
-
-                    tqdm.write(
-                        f"[DB COMMIT] Final batch: {batch_size:,} paths"
-                    )
-
-                tqdm.write(
-                    f"[DRIVE COMPLETE] {drive} | "
-                    f"Files: {found_count:,} | "
-                    f"Time: {time.time() - drive_start:.1f}s | "
-                    f"Errors: {sum(errors.values()) - drive_errors_before:,}"
-                )
-            # Flush anything remaining.
-            flush_batch(cur, batch)
-            conn.commit()
-
-            # Mark paths missing only on successfully scanned drives.
-            for drive in scanned_drives:
-
-                cur.execute(
-                    """
-                    UPDATE photo_paths
-                    SET
-                        status = 'missing',
-                        missing_since = COALESCE(missing_since, NOW())
-                    WHERE drive = %s
-                      AND status = 'present'
-                      AND (
-                          last_seen_run_id IS DISTINCT FROM %s
-                      )
-                    RETURNING path, sha256
-                    """,
-                    (drive, run_id),
-                )
-
-                missing_rows = cur.fetchall()
-
-                for old_path, old_sha in missing_rows:
-                    counts["missing"] += 1
-
-                    if not first_run:
-                        insert_event(
-                            cur,
-                            run_id,
-                            "missing",
-                            old_sha256=old_sha.strip(),
-                            old_path=old_path,
-                        )
-
-            # Count duplicate content records.
-            cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM (
-                    SELECT sha256
-                    FROM photo_paths
-                    WHERE status = 'present'
-                    GROUP BY sha256
-                    HAVING COUNT(*) > 1
-                ) duplicates
-                """
-            )
-            duplicate_groups = cur.fetchone()[0]
-
-            # Finish run.
-            counts["paths_found"] = len(found_keys)
-            counts["duplicate_groups"] = duplicate_groups
-            counts["filesystem_errors"] = sum(errors.values())
-
-            cur.execute(
-                """
-                UPDATE scan_runs
-                SET
-                    finished_at = NOW(),
-                    status = 'completed',
-                    scanned_drives = %s,
-                    counts = %s
-                WHERE id = %s
-                """,
-                (
-                    sorted(scanned_drives),
-                    Jsonb(dict(counts)),
-                    run_id,
-                ),
-            )
-
-            conn.commit()
-
-    # -----------------------------------------------------
-    # SUMMARY
-    # -----------------------------------------------------
-
-    print("\n" + "=" * 55)
-    print(f"Scan run: {run_id}")
-    print(f"Drives scanned: {', '.join(sorted(scanned_drives))}")
-    print(f"Paths found: {counts['paths_found']:,}")
-    print(f"Files hashed: {counts['hashed']:,}")
-    print(f"Hashes skipped: {counts['hash_skipped']:,}")
-    print(f"New content: {counts['new_content']:,}")
-    print(f"New paths: {counts['new_paths']:,}")
-    print(f"Modified files: {counts['modified']:,}")
-    print(f"Missing paths: {counts['missing']:,}")
-    print(f"Duplicate groups: {counts['duplicate_groups']:,}")
-    print(f"Filesystem errors: {counts['filesystem_errors']:,}")
-    print(f"Total time: {time.time() - started:.1f}s")
-    print("=" * 55)
-
-def clear_database():
-    with psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                TRUNCATE TABLE
-                    scan_events,
-                    photo_paths,
-                    photos,
-                    scan_runs
-                RESTART IDENTITY CASCADE;
-            """)
-
-    print("Database cleared successfully.")
 
 if __name__ == "__main__":
-    clear_database()
-    scan_photos()
+    main()

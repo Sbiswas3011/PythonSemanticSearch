@@ -3,11 +3,13 @@ import { useSearch } from "./hooks/useSearch.js";
 import SearchBar from "./components/SearchBar.jsx";
 import PhotoCard from "./components/PhotoCard.jsx";
 import Lightbox from "./components/Lightbox.jsx";
+import Camera from "./components/Camera.jsx";
 
 export default function App() {
-  const { query, results, total, loading, error, search, loadMore } = useSearch();
+  const { query, results, total, loading, error, search, loadMore, searchImage } = useSearch();
   const [selected, setSelected] = useState(null);
   const closeBox = useCallback(() => setSelected(null), []);
+  const [cameraOpen, setCameraOpen] = useState(false);
 
   let status = "";
   if (error) status = "Error: " + error;
@@ -16,7 +18,15 @@ export default function App() {
 
   return (
     <>
-      <SearchBar onSearch={search} />
+      <SearchBar onSearch={search} onOpenCamera={() => setCameraOpen(true)}/>
+
+      {cameraOpen && (
+        <Camera
+          onImageSearch={searchImage}
+          onClose={() => setCameraOpen(false)}
+        />
+      )}
+
       <div id="status">{status}</div>
 
       <div id="grid">

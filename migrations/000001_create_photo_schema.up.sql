@@ -1,49 +1,39 @@
-CREATE TABLE photos (
-    sha256 CHAR(64) PRIMARY KEY,
-    size BIGINT NOT NULL,
-    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 CREATE TABLE scan_runs (
     id BIGSERIAL PRIMARY KEY,
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at TIMESTAMPTZ,
-    status TEXT NOT NULL DEFAULT 'running',
-    scanned_drives TEXT[] NOT NULL DEFAULT '{}',
-    counts JSONB NOT NULL DEFAULT '{}'
+    status TEXT NOT NULL DEFAULT 'running'   -- running | done | failed
 );
 
-CREATE TABLE photo_paths (
+CREATE TABLE shots (
+    shot_id UUID PRIMARY KEY,                -- uuid5 of capture_key
+    capture_key TEXT NOT NULL UNIQUE,        -- 'uuid:<cam_uuid>' or 'subsec:<subsec_key>'
+    cam_uuid TEXT,                           -- Canon ImageUniqueID, NULL if absent
+    subsec_key TEXT,                         -- serial|DateTimeOriginal|SubSecTimeOriginal
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE files (
     id BIGSERIAL PRIMARY KEY,
-    path_key TEXT NOT NULL UNIQUE,
-    path TEXT NOT NULL,
-    drive TEXT NOT NULL,
-    stem TEXT NOT NULL,
-    ext TEXT NOT NULL,
-    sha256 CHAR(64) NOT NULL REFERENCES photos(sha256),
+    path TEXT NOT NULL UNIQUE,
+    shot_id UUID REFERENCES shots(shot_id),  -- NULL if no usable key
     size BIGINT NOT NULL,
     mtime_ns BIGINT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'present',
+    fingerprint TEXT NOT NULL,               -- size + first/last 64 KB hash
+    status TEXT NOT NULL DEFAULT 'present',  -- present | missing
     first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    missing_since TIMESTAMPTZ,
-    last_seen_run_id BIGINT REFERENCES scan_runs(id)
+    missing_since TIMESTAMPTZ
 );
-
-CREATE INDEX idx_photo_paths_sha256 ON photo_paths(sha256);
-CREATE INDEX idx_photo_paths_drive_status ON photo_paths(drive, status);
-
+CREATE INDEX idx_files_shot ON files(shot_id);
+  
 CREATE TABLE scan_events (
     id BIGSERIAL PRIMARY KEY,
     run_id BIGINT NOT NULL REFERENCES scan_runs(id),
-    event TEXT NOT NULL,
-    old_sha256 CHAR(64),
-    new_sha256 CHAR(64),
+    event TEXT NOT NULL,                     -- new | modified | moved | duplicate | deleted
+    shot_id UUID REFERENCES shots(shot_id),
     old_path TEXT,
     new_path TEXT,
-    data JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
-CREATE INDEX idx_scan_events_run ON scan_events(run_id);
-CREATE INDEX idx_scan_events_event ON scan_events(event);
+CREATE INDEX idx_events_run ON scan_events(run_id);

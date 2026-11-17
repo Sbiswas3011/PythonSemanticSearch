@@ -43,6 +43,41 @@ button:disabled { background: #3a3f46; cursor: default; }
 }
 #correction-status { margin-top: 12px; font-size: 14px; color: #9aa0a6; }
 
+.camera {
+  width: min(95vw, 1200px);
+  margin: 20px auto;
+  background: #1e2125;
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: default;
+}
+
+.camera video {
+  width: 100%;
+  height: auto;
+  max-height: 75vh;
+  object-fit: contain;
+  display: block;
+  background: #101214;
+}
+
+.camera .info {
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+}
+
+.camera .info button {
+  flex: 1;
+}
+
+.camera-button {
+  font-size: 24px;
+  padding: 6px 14px;
+  min-width: 52px;
+  transform: translateY(-px);
+}
+
 @media (max-width: 600px) {
   .params { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

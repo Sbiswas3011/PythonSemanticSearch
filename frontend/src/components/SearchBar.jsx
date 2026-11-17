@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-export default function SearchBar({ onSearch }) {
+export default function SearchBar({ onSearch, onOpenCamera }) {
   const [text, setText] = useState("");
 
   const handleSubmit = e => {
@@ -17,7 +17,12 @@ export default function SearchBar({ onSearch }) {
           placeholder="Describe a photo, e.g. a flamingo flying alone"
           autoFocus
         />
+
         <button type="submit">Search</button>
+
+        <button className="camera-button" type="button" onClick={onOpenCamera}>
+          📷
+        </button>
       </form>
     </header>
   );

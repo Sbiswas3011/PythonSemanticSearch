@@ -12,6 +12,7 @@ import re, os
 from flask_cors import CORS
 from botocore.exceptions import ClientError
 import boto3
+from PIL import Image
  
 # ---------- settings ----------
 BASE = Path(__file__).parent
@@ -44,7 +45,7 @@ AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 print("Loading model...", flush=True)
-model = SentenceTransformer(MODEL_DIR, device="cpu", config_kwargs={"audio_config": None, "vision_config": None})
+model = SentenceTransformer(MODEL_DIR, device="cpu", config_kwargs={"audio_config": None})
  
 data = np.load(EMB_FILE)
 ids, vecs = data["ids"], data["vectors"]
@@ -80,17 +81,16 @@ CORS(app, resources={
 lock = threading.Lock()          # the model isn't safe to call from several threads at once
 cache = OrderedDict()            # query -> (order, scores), keeps the last 20 queries
 
-def rank(q, contrastive=False):
-    # Separate cached results for original and contrastive embeddings.
-    cache_key = (q, contrastive)
+def rank(q="", contrastive=False, image=None):
+    # Preserve existing text cache behaviour.
+    cache_key = (q, contrastive) if image is None else None
 
-    if cache_key in cache:
+    if cache_key is not None and cache_key in cache:
         cache.move_to_end(cache_key)
         return cache[cache_key]
 
-    # Parse expressions like:
-    # human + outdoors - cage + wildlife - indoors
-    parts = re.split(r"\s+([+-])\s+", q)
+    # Parse text expressions.
+    parts = re.split(r"\s+([+-])\s+", q.strip()) if q.strip() else []
 
     terms = []
     sign = 1
@@ -107,12 +107,26 @@ def rank(q, contrastive=False):
         else:
             terms.append((part, sign))
 
-    if not terms or not any(s > 0 for _, s in terms):
-        raise ValueError("Query must contain at least one positive term.")
+    if image is None and not any(s > 0 for _, s in terms):
+        raise ValueError("Query must contain an image or positive text term.")
 
-    # Encode every phrase separately.
-    with lock:
+    # Build combined query vector.
+    qv = np.zeros(DIM, dtype=np.float32)
+
+    # Encode uploaded image.
+    if image is not None:
+        image_vector = model.encode(
+            {"image": image},
+            truncate_dim=DIM,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        qv += np.asarray(image_vector).reshape(-1)
+
+    # Encode text terms.
+    if terms:
         texts = [text for text, _ in terms]
+
         vectors = model.encode(
             texts,
             prompt_name="SearchQuery",
@@ -121,30 +135,33 @@ def rank(q, contrastive=False):
             convert_to_numpy=True,
         )
 
-    # Build the combined query vector.
-    qv = np.zeros(DIM, dtype=np.float32)
-
-    for (_, sig), vector in zip(terms, vectors):
-        qv += sig * vector
+        for (_, sig), vector in zip(terms, vectors):
+            qv += sig * vector
 
     norm = np.linalg.norm(qv)
+
     if norm < 1e-8:
-        raise ValueError("Positive and negative terms cancel out.")
+        raise ValueError("Query vectors cancel out.")
 
     qv /= norm
 
-    # Choose the embedding set.
+    # Choose embedding set.
     image_vecs = Cvecs if contrastive else vecs
 
     scores = image_vecs @ qv
     order = scores.argsort()[::-1]
 
-    cache[cache_key] = (order, scores)
+    result = (order, scores)
 
-    if len(cache) > 20:
-        cache.popitem(last=False)
+    # Cache text-only searches.
+    if cache_key is not None:
+        cache[cache_key] = result
 
-    return cache[cache_key]
+        if len(cache) > 20:
+            cache.popitem(last=False)
+
+    return result
+
 
 def contrastive_update(
     index,
@@ -211,31 +228,43 @@ def contrastive_update(
 
     return result
  
- 
 @app.route("/")
 def index():
     return send_from_directory(BASE, "index.html")
- 
-@app.route("/search")
+
+@app.route("/search", methods=["GET", "POST"])
 def search():
     q = request.args.get("q", "").strip()
+    image = None
+
+    if request.method == "POST":
+        q = request.form.get("q", "").strip()
+
+        if "image" in request.files:
+            image = Image.open(
+                request.files["image"].stream
+            ).convert("RGB")
+
     try:
-        offset = max(0, int(request.args.get("offset", 0)))
+        offset = max(0, int(request.values.get("offset", 0)))
     except ValueError:
         offset = 0
-    if not q:
+
+    if not q and image is None:
         return jsonify(total=0, results=[])
- 
-    order, scores = rank(q,True)
+
+    order, scores = rank(q, True, image=image)
+
     results = []
     for i in order[offset:offset + PAGE]:
         r = meta.get(str(ids[i]), {})
         results.append({
-            "index": int(i), 
+            "index": int(i),
             "id": str(ids[i]),
             "score": round(float(scores[i]), 3),
             "raw_path": r.get("used", ""),
         })
+
     return jsonify(total=len(order), results=results)
 
 @app.route("/img/<path:rid>")
@@ -292,14 +321,14 @@ def correct_image():
             return jsonify(error="Invalid embedding index"), 400
 
         # Encode both concepts using the same query pipeline.
-        with lock:
-            text_vecs = model.encode(
-                [wrong_text, correct_text],
-                prompt_name="SearchQuery",
-                truncate_dim=DIM,
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-            )
+
+        text_vecs = model.encode(
+            [wrong_text, correct_text],
+            prompt_name="SearchQuery",
+            truncate_dim=DIM,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
 
         # Update the selected image embedding.
         updated = contrastive_update(
