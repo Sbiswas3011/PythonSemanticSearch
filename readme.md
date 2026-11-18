@@ -65,3 +65,5 @@ migrate create -ext sql -dir migrations -seq create_photo_schema
 migrate -path migrations -database "$DB" up
 
 migrate -path migrations -database "$DB" down 1
+
+cloudflared tunnel --url http://localhost:5173

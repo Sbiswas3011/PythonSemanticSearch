@@ -5,5 +5,12 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [react()],
   base: "./",            // relative asset paths so dist/ works on any static host
-  build: { outDir: "dist" }
+  build: { outDir: "dist" },
+  server: {
+    host: "0.0.0.0",
+    port: 5173,
+    allowedHosts: [
+      ".trycloudflare.com"
+    ]
+  }
 })

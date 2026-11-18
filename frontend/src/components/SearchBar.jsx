@@ -14,7 +14,7 @@ export default function SearchBar({ onSearch, onOpenCamera }) {
         <input
           value={text}
           onChange={e => setText(e.target.value)}
-          placeholder="Describe a photo, e.g. a flamingo flying alone"
+          placeholder="Describe a photo, e.g. a flamingo"
           autoFocus
         />
 

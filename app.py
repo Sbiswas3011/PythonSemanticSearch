@@ -74,7 +74,9 @@ CORS(app, resources={
     r"/*": {
         "origins": [
             "https://sbiswas3011.github.io",
-            "http://localhost:5173"
+            "http://localhost:5173",
+            "http://192.168.29.220:5173",
+            "https://expressions-leads-grand-seafood.trycloudflare.com"
         ]
     }
 })
@@ -228,9 +230,9 @@ def contrastive_update(
 
     return result
  
-@app.route("/")
-def index():
-    return send_from_directory(BASE, "index.html")
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
 
 @app.route("/search", methods=["GET", "POST"])
 def search():

@@ -75,9 +75,37 @@ button:disabled { background: #3a3f46; cursor: default; }
   font-size: 24px;
   padding: 6px 14px;
   min-width: 52px;
-  transform: translateY(-px);
 }
 
 @media (max-width: 600px) {
-  .params { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  header {
+    padding: 10px;
+    width: 100%;
+  }
+
+  .searchbar {
+    min-width: 0;
+    gap: 6px;
+    width: 100%;
+  }
+
+  .searchbar input {
+    min-width: 0;
+    width: 0;
+    padding: 10px 8px;
+    font-size: 14px;
+  }
+
+  .searchbar button {
+    flex-shrink: 0;
+    padding: 10px 12px;
+    font-size: 14px;
+  }
+
+  .searchbar .camera-button {
+    min-width: 44px;
+    padding: 6px;
+    font-size: 22px;
+    transform: none;
+  }
 }

@@ -1,44 +1,65 @@
 import { useRef, useEffect } from "react";
 
-export default function Camera({ onImageSearch, onClose }) {
+export default function Camera({ onImageSearch, onClose, onError }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
+  const activeRef = useRef(true);
 
   useEffect(() => {
-    let active = true;
+    activeRef.current = true;
 
     const startCamera = async () => {
       try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error("Camera API unavailable. Use HTTPS or localhost.");
+        }
+
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: "environment" },
           audio: false
         });
 
-        if (!active) {
+        if (!activeRef.current) {
           stream.getTracks().forEach(track => track.stop());
           return;
         }
 
         streamRef.current = stream;
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
+        const video = videoRef.current;
+
+        if (video) {
+          video.srcObject = stream;
+          // await video.play();
         }
       } catch (err) {
+        if (!activeRef.current) return;
+
+        console.error("Camera initialization failed:", err);
+
         onClose();
-        alert("Unable to access camera: " + err.message);
+
+        // Show the error after the camera component closes.
+        onError(err.message);
       }
     };
 
     startCamera();
 
     return () => {
-      active = false;
-      streamRef.current?.getTracks().forEach(track => track.stop());
+      activeRef.current = false;
+
+      streamRef.current?.getTracks().forEach(track => {
+        track.stop();
+      });
+
       streamRef.current = null;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
     };
-  }, []);
+  }, [onClose]);
 
   const captureImage = () => {
     const video = videoRef.current;
@@ -87,63 +108,3 @@ export default function Camera({ onImageSearch, onClose }) {
   );
 }
 
-
-// import { useRef, useEffect } from "react";
-
-// export default function Camera({ onImageSearch, onClose }) {
-//   const videoRef = useRef(null);
-//   const streamRef = useRef(null);
-
-//   useEffect(() => {
-//     let active = true;
-
-//     async function startCamera() {
-//       try {
-//         console.log("Starting camera");
-
-//         const stream = await navigator.mediaDevices.getUserMedia({
-//           video: true,
-//           audio: false
-//         });
-
-//         if (!active) {
-//           stream.getTracks().forEach(track => track.stop());
-//           return;
-//         }
-
-//         streamRef.current = stream;
-//         videoRef.current.srcObject = stream;
-
-//         await videoRef.current.play();
-
-//         console.log("Video playing");
-//       } catch (err) {
-//         console.error("Camera failed:", err);
-//       }
-//     }
-
-//     startCamera();
-
-//     return () => {
-//       active = false;
-//       streamRef.current?.getTracks().forEach(track => track.stop());
-//       streamRef.current = null;
-//     };
-//   }, []);
-
-//   return (
-//     <div className="camera card">
-//       <video ref={videoRef} autoPlay playsInline muted />
-
-//       <div className="info">
-//         <button type="button" onClick={() => onImageSearch(null)}>
-//           Capture
-//         </button>
-
-//         <button type="button" onClick={onClose}>
-//           Cancel
-//         </button>
-//       </div>
-//     </div>
-//   );
-// }
