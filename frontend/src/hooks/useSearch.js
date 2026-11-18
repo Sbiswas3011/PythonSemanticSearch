@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from "react";
-import { searchPhotos, searchPhotosByImage } from "../api";
+import { searchPhotos, searchPhotosByImage, searchPhotosById } from "../api";
 
 export function useSearch() {
   const [query, setQuery] = useState("");
@@ -7,21 +7,33 @@ export function useSearch() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [searchId, setSearchId] = useState(null);
   const requestId = useRef(0); // ignore responses from outdated searches
   const imageRef = useRef(null);
 
-  const run = useCallback(async (q, offset, image = null) => {
+  const run = useCallback(async (q, offset, image = null, searchId = null, size = "small") => {
     const id = ++requestId.current;
     setLoading(true);
     setError(null);
+
     try {
-      const data = image
-        ? await searchPhotosByImage(image, offset)
-        : await searchPhotos(q, offset);
+      let data;
+
+      if (searchId) {
+        data = await searchPhotosById(searchId, offset);
+      } else if (image) {
+        data = await searchPhotosByImage(image, offset, size);
+      } else {
+        data = await searchPhotos(q, offset);
+      }
 
       if (id !== requestId.current) return;
+
       setTotal(data.total);
-      setResults(prev => (offset === 0 ? data.results : [...prev, ...data.results]));
+      setSearchId(data.search_id || searchId || null);
+      setResults((prev) =>
+        offset === 0 ? data.results : [...prev, ...data.results],
+      );
     } catch (e) {
       if (id === requestId.current) setError(e.message);
     } finally {
@@ -30,7 +42,7 @@ export function useSearch() {
   }, []);
 
   const search = useCallback(
-    text => {
+    (text) => {
       const q = text.trim();
       if (!q) return;
       setQuery(q);
@@ -39,25 +51,40 @@ export function useSearch() {
       window.scrollTo(0, 0);
       run(q, 0);
     },
-    [run]
+    [run],
   );
 
-  const searchImage = useCallback(file => {
-    if (!file) return;
+  const searchImage = useCallback(
+    (file) => {
+      if (!file) return;
 
-    imageRef.current = file;
-    setQuery("Image search");
-    setResults([]);
-    setTotal(0);
-    window.scrollTo(0, 0);
+      imageRef.current = file;
+      setQuery("Image search");
+      setResults([]);
+      setTotal(0);
+      window.scrollTo(0, 0);
 
-    run("", 0, file);
-  }, [run]);
+      run("", 0, file, null, "small");
+    },
+    [run],
+  );
 
   const loadMore = useCallback(() => {
     if (loading || results.length >= total) return;
-    run(query, results.length, imageRef.current);
-  }, [loading, results.length, total, query, run]);
+    // run(query, results.length, imageRef.current);
+    console.log("searchId in loadMore:", searchId);
+    run(query, results.length, null, searchId);
+  }, [loading, results.length, total, query, searchId, run]);
 
-  return { query, results, total, loading, error, search, loadMore, searchImage };
+  return {
+    query,
+    results,
+    total,
+    loading,
+    error,
+    searchId,
+    search,
+    loadMore,
+    searchImage,
+  };
 }

@@ -2,6 +2,7 @@ import json
 import threading
 from collections import OrderedDict
 from pathlib import Path
+import uuid
 from flask import send_from_directory, redirect, abort
 import numpy as np
 from flask import Flask, Response, abort, jsonify, request, send_from_directory
@@ -12,7 +13,7 @@ import re, os
 from flask_cors import CORS
 from botocore.exceptions import ClientError
 import boto3
-from PIL import Image
+from PIL import Image, ImageOps
  
 # ---------- settings ----------
 BASE = Path(__file__).parent
@@ -33,6 +34,12 @@ META_FILE = BASE / "convert_results.jsonl"
 
 DIM = 768      # must match the DIM used when embedding
 PAGE = 24      # results per page
+IMAGE_SIZES = {
+    "small": 224,
+    "medium": 384,
+    "large": 768,
+    "original": None,
+}
 # ------------------------------
 
 S3_BUCKET = os.environ.get(
@@ -76,14 +83,38 @@ CORS(app, resources={
             "https://sbiswas3011.github.io",
             "http://localhost:5173",
             "http://192.168.29.220:5173",
-            "https://expressions-leads-grand-seafood.trycloudflare.com"
+            "https://haven-poem-important-philosophy.trycloudflare.com"
         ]
     }
 })
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 lock = threading.Lock()          # the model isn't safe to call from several threads at once
 cache = OrderedDict()            # query -> (order, scores), keeps the last 20 queries
+image_cache = OrderedDict()
+CACHE_MAX = 20
 
-def rank(q="", contrastive=False, image=None):
+def preprocess_image(image, size="medium"):
+    image = ImageOps.exif_transpose(image).convert("RGB")
+
+    max_size = IMAGE_SIZES.get(size, 384)
+
+    if max_size is not None:
+        image.thumbnail(
+            (max_size, max_size),
+            Image.Resampling.LANCZOS
+        )
+
+    return image
+
+def rank(q="", contrastive=False, image=None, search_id=None):
+
+    if search_id is not None:
+        if search_id not in image_cache:
+            raise ValueError("Image search expired or not found.")
+
+        image_cache.move_to_end(search_id)
+        return image_cache[search_id]
+    
     # Preserve existing text cache behaviour.
     cache_key = (q, contrastive) if image is None else None
 
@@ -159,7 +190,7 @@ def rank(q="", contrastive=False, image=None):
     if cache_key is not None:
         cache[cache_key] = result
 
-        if len(cache) > 20:
+        if len(cache) > CACHE_MAX:
             cache.popitem(last=False)
 
     return result
@@ -236,26 +267,46 @@ def health():
 
 @app.route("/search", methods=["GET", "POST"])
 def search():
+
+    search_id = request.values.get("search_id")
+
     q = request.args.get("q", "").strip()
     image = None
 
     if request.method == "POST":
         q = request.form.get("q", "").strip()
 
-        if "image" in request.files:
-            image = Image.open(
-                request.files["image"].stream
-            ).convert("RGB")
+        if search_id is None and "image" in request.files:
+            size = request.form.get("size", "medium").lower()
 
+            if size not in IMAGE_SIZES:
+                return jsonify(error="Invalid image size"), 400
+
+            try:
+                image = Image.open(
+                    request.files["image"].stream
+                )
+                image = preprocess_image(image, size)
+            except Exception:
+                return jsonify(error="Invalid image file"), 400
+            
     try:
         offset = max(0, int(request.values.get("offset", 0)))
     except ValueError:
         offset = 0
 
-    if not q and image is None:
+    if not q and image is None and search_id is None:
         return jsonify(total=0, results=[])
 
-    order, scores = rank(q, True, image=image)
+    order, scores = rank(q, True, image=image, search_id=search_id)
+
+    if image is not None and search_id is None:
+        search_id = str(uuid.uuid4())
+
+        image_cache[search_id] = (order, scores)
+
+        if len(image_cache) > CACHE_MAX:
+            image_cache.popitem(last=False)
 
     results = []
     for i in order[offset:offset + PAGE]:
@@ -267,7 +318,15 @@ def search():
             "raw_path": r.get("used", ""),
         })
 
-    return jsonify(total=len(order), results=results)
+    response = {
+        "total": len(order),
+        "results": results,
+    }
+
+    if search_id:
+        response["search_id"] = search_id
+
+    return jsonify(response)
 
 @app.route("/img/<path:rid>")
 def img(rid):
@@ -347,6 +406,7 @@ def correct_image():
         # Invalidate cached search rankings.
         with lock:
             cache.clear()
+            image_cache.clear()
 
         return jsonify(
             success=True,

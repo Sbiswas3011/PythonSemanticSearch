@@ -22,10 +22,11 @@ export async function correctEmbedding(payload) {
   return data;
 }
 
-export async function searchPhotosByImage(file, offset = 0) {
+export async function searchPhotosByImage(file, offset = 0, size = "small") {
   const formData = new FormData();
   formData.append("image", file);
   formData.append("offset", offset);
+  formData.append("size", size);
 
   const response = await fetch(`${API_BASE}/search`, {
     method: "POST",
@@ -34,6 +35,21 @@ export async function searchPhotosByImage(file, offset = 0) {
 
   if (!response.ok) {
     throw new Error("Image search failed");
+  }
+
+  return response.json();
+}
+
+export async function searchPhotosById(searchId, offset) {
+  const params = new URLSearchParams({
+    search_id: searchId,
+    offset: String(offset),
+  });
+
+  const response = await fetch(`${API_BASE}/search?${params}`);
+
+  if (!response.ok) {
+    throw new Error("Image search expired or failed");
   }
 
   return response.json();

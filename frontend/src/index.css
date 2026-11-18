@@ -44,7 +44,7 @@ button:disabled { background: #3a3f46; cursor: default; }
 #correction-status { margin-top: 12px; font-size: 14px; color: #9aa0a6; }
 
 .camera {
-  width: min(95vw, 1200px);
+  width: min(98vw, 1500px);
   margin: 20px auto;
   background: #1e2125;
   border-radius: 10px;
@@ -55,26 +55,62 @@ button:disabled { background: #3a3f46; cursor: default; }
 .camera video {
   width: 100%;
   height: auto;
-  max-height: 75vh;
+  max-height: 85vh;
   object-fit: contain;
   display: block;
   background: #101214;
-}
-
-.camera .info {
-  display: flex;
-  gap: 10px;
-  padding: 10px;
-}
-
-.camera .info button {
-  flex: 1;
 }
 
 .camera-button {
   font-size: 24px;
   padding: 6px 14px;
   min-width: 52px;
+}
+
+.camera-controls {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+
+.quality-control {
+  display: grid;
+  gap: 8px;
+}
+
+.quality-control > span {
+  font-size: 13px;
+  color: #9aa0a6;
+}
+
+.quality-options {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.quality-options button {
+  padding: 9px 4px;
+  font-size: 13px;
+  border: 1px solid #3a3f46;
+  background: #15171a;
+  color: #e8e8e8;
+}
+
+.quality-options button.active {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: white;
+}
+
+.camera-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.camera-actions button {
+  flex: 1;
+  padding: 11px;
 }
 
 @media (max-width: 600px) {
