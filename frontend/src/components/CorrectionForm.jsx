@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { correctEmbedding } from "../api";
 
-export default function CorrectionForm({ photo, query }) {
+export default function CorrectionForm({ photo, query, dim }) {
   const [correct, setCorrect] = useState("");
   const [params, setParams] = useState({
     margin: 0.15,
@@ -32,7 +32,8 @@ export default function CorrectionForm({ photo, query }) {
         margin: Number(params.margin),
         preserve_weight: Number(params.preserveWeight),
         lr: Number(params.lr),
-        steps: Number(params.steps)
+        steps: Number(params.steps),
+        search_dim: Number(dim)  // Pass the search dimension to the API
       });
       setStatus("Correction applied successfully.");
     } catch (err) {

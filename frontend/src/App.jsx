@@ -12,7 +12,6 @@ export default function App() {
     total,
     loading,
     error,
-    searchId,
     search,
     loadMore,
     searchImage,
@@ -22,7 +21,9 @@ export default function App() {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraError, setCameraError] = useState(null);
   const [apiUnavailable, setApiUnavailable] = useState(false);
+  const [dim, setDim] = useState(0);
   const cameraRef = useRef(null);
+  const [quality, setQuality] = useState("original");
 
   let status = "";
   if (error) status = "Error: " + error;
@@ -105,6 +106,10 @@ export default function App() {
           <SearchBar
             onSearch={search}
             onOpenCamera={() => setCameraOpen(true)}
+            dim={dim}
+            setDim={setDim}
+            quality={quality}
+            setQuality={setQuality}
           />
 
           {cameraOpen && (
@@ -113,6 +118,9 @@ export default function App() {
                 onImageSearch={searchImage}
                 onClose={closeCamera}
                 onError={setCameraError}
+                dim={dim}
+                quality={quality}
+                setQuality={setQuality}
               />
             </div>
           )}
@@ -126,12 +134,12 @@ export default function App() {
           </div>
 
           {results.length < total && (
-            <button id="more" onClick={loadMore} disabled={loading}>
+            <button id="more" onClick={() => loadMore(dim, quality)} disabled={loading}>
               Load more
             </button>
           )}
 
-          <Lightbox photo={selected} query={query} onClose={closeBox} />
+          <Lightbox photo={selected} query={query} onClose={closeBox} dim={dim} />
         </>
       )}
     </>

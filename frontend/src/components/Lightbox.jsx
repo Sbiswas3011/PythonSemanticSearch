@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { imgUrl } from "../api";
 import CorrectionForm from "./CorrectionForm.jsx";
 
-export default function Lightbox({ photo, query, onClose }) {
+export default function Lightbox({ photo, query, onClose, dim }) {
   useEffect(() => {
     if (!photo) return;
     const onKey = e => e.key === "Escape" && onClose();
@@ -18,7 +18,7 @@ export default function Lightbox({ photo, query, onClose }) {
         <img src={imgUrl(photo.id)} alt={photo.id} onClick={onClose} />
         <div className="cap">{photo.id}   {photo.raw_path}</div>
         {/* key resets the form whenever a different photo is opened */}
-        <CorrectionForm key={photo.id} photo={photo} query={query} />
+        <CorrectionForm key={photo.id} photo={photo} query={query} dim={dim} />
       </div>
     </div>
   );

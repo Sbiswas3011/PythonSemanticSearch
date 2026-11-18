@@ -11,7 +11,7 @@ export function useSearch() {
   const requestId = useRef(0); // ignore responses from outdated searches
   const imageRef = useRef(null);
 
-  const run = useCallback(async (q, offset, image = null, searchId = null, size = "small") => {
+  const run = useCallback(async (q, offset, dim = 0, image = null, searchId = null, size = "tiny") => {
     const id = ++requestId.current;
     setLoading(true);
     setError(null);
@@ -22,9 +22,9 @@ export function useSearch() {
       if (searchId) {
         data = await searchPhotosById(searchId, offset);
       } else if (image) {
-        data = await searchPhotosByImage(image, offset, size);
+        data = await searchPhotosByImage(image, offset, size, dim);
       } else {
-        data = await searchPhotos(q, offset);
+        data = await searchPhotos(q, offset, dim);
       }
 
       if (id !== requestId.current) return;
@@ -42,38 +42,37 @@ export function useSearch() {
   }, []);
 
   const search = useCallback(
-    (text) => {
+    (text, dim, size) => {
       const q = text.trim();
       if (!q) return;
       setQuery(q);
       setResults([]);
       setTotal(0);
       window.scrollTo(0, 0);
-      run(q, 0);
+      run(q, 0, dim, null, null, size);
     },
     [run],
   );
 
   const searchImage = useCallback(
-    (file) => {
+    (file, dim, size) => {
       if (!file) return;
 
       imageRef.current = file;
-      setQuery("Image search");
+      setQuery("");
       setResults([]);
       setTotal(0);
       window.scrollTo(0, 0);
-
-      run("", 0, file, null, "small");
+      run("", 0, dim, file, null, size);
     },
     [run],
   );
 
-  const loadMore = useCallback(() => {
+  const loadMore = useCallback((dim, size) => {
     if (loading || results.length >= total) return;
     // run(query, results.length, imageRef.current);
     console.log("searchId in loadMore:", searchId);
-    run(query, results.length, null, searchId);
+    run(query, results.length, dim, null, searchId, size);
   }, [loading, results.length, total, query, searchId, run]);
 
   return {

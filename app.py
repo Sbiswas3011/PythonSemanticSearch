@@ -35,11 +35,13 @@ META_FILE = BASE / "convert_results.jsonl"
 DIM = 768      # must match the DIM used when embedding
 PAGE = 24      # results per page
 IMAGE_SIZES = {
+    "tiny": 128,
     "small": 224,
     "medium": 384,
     "large": 768,
     "original": None,
 }
+EMBED_DIMS = (768, 512, 256, 128)
 # ------------------------------
 
 S3_BUCKET = os.environ.get(
@@ -93,10 +95,32 @@ cache = OrderedDict()            # query -> (order, scores), keeps the last 20 q
 image_cache = OrderedDict()
 CACHE_MAX = 20
 
-def preprocess_image(image, size="medium"):
+def prepare_embeddings(embeddings):
+    result = {}
+
+    for dim in (768, 512, 256, 128):
+        if dim == 768:
+            result[dim] = embeddings
+            continue
+
+        v = embeddings[:, :dim].copy()
+
+        v /= np.maximum(
+            np.linalg.norm(v, axis=1, keepdims=True),
+            1e-8
+        )
+
+        result[dim] = v
+
+    return result
+
+vecs_by_dim = prepare_embeddings(vecs)
+Cvecs_by_dim = prepare_embeddings(Cvecs)
+
+def preprocess_image(image, size="tiny"):
     image = ImageOps.exif_transpose(image).convert("RGB")
 
-    max_size = IMAGE_SIZES.get(size, 384)
+    max_size = IMAGE_SIZES.get(size, 128)
 
     if max_size is not None:
         image.thumbnail(
@@ -106,7 +130,7 @@ def preprocess_image(image, size="medium"):
 
     return image
 
-def rank(q="", contrastive=False, image=None, search_id=None):
+def rank(q="", contrastive=False, image=None, search_id=None, dim=0):
 
     if search_id is not None:
         if search_id not in image_cache:
@@ -116,7 +140,7 @@ def rank(q="", contrastive=False, image=None, search_id=None):
         return image_cache[search_id]
     
     # Preserve existing text cache behaviour.
-    cache_key = (q, contrastive) if image is None else None
+    cache_key = (q, contrastive, dim) if image is None else None
 
     if cache_key is not None and cache_key in cache:
         cache.move_to_end(cache_key)
@@ -144,13 +168,13 @@ def rank(q="", contrastive=False, image=None, search_id=None):
         raise ValueError("Query must contain an image or positive text term.")
 
     # Build combined query vector.
-    qv = np.zeros(DIM, dtype=np.float32)
+    qv = np.zeros(EMBED_DIMS[dim], dtype=np.float32)
 
     # Encode uploaded image.
     if image is not None:
         image_vector = model.encode(
             {"image": image},
-            truncate_dim=DIM,
+            truncate_dim=EMBED_DIMS[dim],
             normalize_embeddings=True,
             convert_to_numpy=True,
         )
@@ -163,7 +187,7 @@ def rank(q="", contrastive=False, image=None, search_id=None):
         vectors = model.encode(
             texts,
             prompt_name="SearchQuery",
-            truncate_dim=DIM,
+            truncate_dim=EMBED_DIMS[dim],
             normalize_embeddings=True,
             convert_to_numpy=True,
         )
@@ -179,7 +203,7 @@ def rank(q="", contrastive=False, image=None, search_id=None):
     qv /= norm
 
     # Choose embedding set.
-    image_vecs = Cvecs if contrastive else vecs
+    image_vecs = Cvecs_by_dim[EMBED_DIMS[dim]] if contrastive else vecs_by_dim[EMBED_DIMS[dim]]
 
     scores = image_vecs @ qv
     order = scores.argsort()[::-1]
@@ -205,6 +229,7 @@ def contrastive_update(
     preserve_weight=2.0,
     lr=0.01,
     steps=200,
+    search_dim=0
 ):
     # Keep a normalized copy of the original embedding.
     original = F.normalize(
@@ -253,7 +278,8 @@ def contrastive_update(
     result = F.normalize(updated.detach(), dim=0).cpu().numpy()
 
     # Update the image embedding in memory.
-    Cvecs[index] = result.astype(Cvecs.dtype, copy=False)
+    # Cvecs[index] = result.astype(Cvecs.dtype, copy=False)
+    Cvecs_by_dim[EMBED_DIMS[search_dim]][index] = result.astype(Cvecs_by_dim[EMBED_DIMS[search_dim]].dtype, copy=False)
 
     # Cached rankings are now stale.
     with lock:
@@ -269,7 +295,6 @@ def health():
 def search():
 
     search_id = request.values.get("search_id")
-
     q = request.args.get("q", "").strip()
     image = None
 
@@ -277,7 +302,7 @@ def search():
         q = request.form.get("q", "").strip()
 
         if search_id is None and "image" in request.files:
-            size = request.form.get("size", "medium").lower()
+            size = request.form.get("size", "tiny").lower()
 
             if size not in IMAGE_SIZES:
                 return jsonify(error="Invalid image size"), 400
@@ -298,7 +323,12 @@ def search():
     if not q and image is None and search_id is None:
         return jsonify(total=0, results=[])
 
-    order, scores = rank(q, True, image=image, search_id=search_id)
+    dim = int(request.form.get("dim", 0))
+
+    if not 0 <= dim < len(EMBED_DIMS):
+        return jsonify(error="Invalid dimension"), 400
+    
+    order, scores = rank(q, True, image=image, search_id=search_id, dim=dim)
 
     if image is not None and search_id is None:
         search_id = str(uuid.uuid4())
@@ -365,6 +395,10 @@ def correct_image():
         steps = int(data["steps"])
         wrong_text = data["wrong"]
         correct_text = data["correct"]
+        search_dim = int(data.get("search_dim", 0))
+
+        if not 0 <= search_dim < len(EMBED_DIMS):
+            return jsonify(error="Invalid dimension"), 400
 
         if not isinstance(wrong_text, str) or not wrong_text.strip():
             raise ValueError("Invalid wrong concept")
@@ -386,7 +420,7 @@ def correct_image():
         text_vecs = model.encode(
             [wrong_text, correct_text],
             prompt_name="SearchQuery",
-            truncate_dim=DIM,
+            truncate_dim=EMBED_DIMS[search_dim],
             normalize_embeddings=True,
             convert_to_numpy=True,
         )
@@ -394,13 +428,14 @@ def correct_image():
         # Update the selected image embedding.
         updated = contrastive_update(
             index=index,
-            image_vec=vecs[index],
+            image_vec=vecs_by_dim[EMBED_DIMS[search_dim]][index],
             wrong_text_vec=text_vecs[0],
             correct_text_vec=text_vecs[1],
             margin=margin,
             preserve_weight=preserve_weight,
             lr=lr,
-            steps=steps
+            steps=steps,
+            search_dim=search_dim
         )
 
         # Invalidate cached search rankings.

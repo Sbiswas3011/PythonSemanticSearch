@@ -3,9 +3,9 @@ const API_BASE = import.meta.env.VITE_API_BASE;
 export const apiUrl = path => `${API_BASE}${path}`;
 export const imgUrl = id => apiUrl("/img/" + encodeURIComponent(id));
 
-export async function searchPhotos(q, offset) {
+export async function searchPhotos(q, offset, dim = 0) {
   const res = await fetch(
-    apiUrl("/search?q=" + encodeURIComponent(q) + "&offset=" + offset)
+    apiUrl("/search?q=" + encodeURIComponent(q) + "&offset=" + offset + "&dim=" + dim)
   );
   if (!res.ok) throw new Error("Search failed (" + res.status + ")");
   return res.json();
@@ -22,11 +22,12 @@ export async function correctEmbedding(payload) {
   return data;
 }
 
-export async function searchPhotosByImage(file, offset = 0, size = "small") {
+export async function searchPhotosByImage(file, offset = 0, size = "tiny", dim = 0) {
   const formData = new FormData();
   formData.append("image", file);
   formData.append("offset", offset);
   formData.append("size", size);
+  formData.append("dim", dim);
 
   const response = await fetch(`${API_BASE}/search`, {
     method: "POST",
