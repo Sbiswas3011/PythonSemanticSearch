@@ -323,7 +323,9 @@ def search():
     if not q and image is None and search_id is None:
         return jsonify(total=0, results=[])
 
-    dim = int(request.form.get("dim", 0))
+    dim = int(request.args.get("dim", 0))
+
+    # print("DIM:", dim)
 
     if not 0 <= dim < len(EMBED_DIMS):
         return jsonify(error="Invalid dimension"), 400
@@ -428,7 +430,7 @@ def correct_image():
         # Update the selected image embedding.
         updated = contrastive_update(
             index=index,
-            image_vec=vecs_by_dim[EMBED_DIMS[search_dim]][index],
+            image_vec=Cvecs_by_dim[EMBED_DIMS[search_dim]][index],
             wrong_text_vec=text_vecs[0],
             correct_text_vec=text_vecs[1],
             margin=margin,

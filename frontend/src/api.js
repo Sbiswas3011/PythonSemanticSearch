@@ -27,9 +27,13 @@ export async function searchPhotosByImage(file, offset = 0, size = "tiny", dim =
   formData.append("image", file);
   formData.append("offset", offset);
   formData.append("size", size);
-  formData.append("dim", dim);
+  // formData.append("dim", dim);
 
-  const response = await fetch(`${API_BASE}/search`, {
+  const params = new URLSearchParams({
+    dim: String(dim),
+  });
+
+  const response = await fetch(`${API_BASE}/search?${params}`, {
     method: "POST",
     body: formData
   });
