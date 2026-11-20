@@ -7,4 +7,5 @@ services:
       - /opt/semantic-search/model/embeddinggemma2:/opt/semantic-search/model/embeddinggemma2:ro
       - /opt/semantic-search/PythonSemanticSearch/embeddings.npz:/app/embeddings.npz:ro
       - /opt/semantic-search/PythonSemanticSearch/convert_results.jsonl:/app/convert_results.jsonl:ro
+      - /opt/semantic-search/PythonSemanticSearch/certs:/certs:ro
     restart: unless-stopped

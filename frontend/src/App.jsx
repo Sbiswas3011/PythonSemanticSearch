@@ -51,10 +51,11 @@ export default function App() {
 
   useEffect(() => {
     if (cameraOpen) {
-      cameraRef.current?.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
+      // cameraRef.current?.scrollIntoView({
+      //   behavior: "smooth",
+      //   block: "start",
+      // });
+      window.scrollTo({ top: 0, behavior: "smooth" });
 
       document.body.style.overflow = "hidden";
     } else {
@@ -105,11 +106,10 @@ export default function App() {
         <>
           <SearchBar
             onSearch={search}
+            onImageSearch={searchImage}
             onOpenCamera={() => setCameraOpen(true)}
             dim={dim}
             setDim={setDim}
-            quality={quality}
-            setQuality={setQuality}
           />
 
           {cameraOpen && (
@@ -134,7 +134,7 @@ export default function App() {
           </div>
 
           {results.length < total && (
-            <button id="more" onClick={() => loadMore(dim, quality)} disabled={loading}>
+            <button id="more" onClick={() => loadMore(dim)} disabled={loading}>
               Load more
             </button>
           )}

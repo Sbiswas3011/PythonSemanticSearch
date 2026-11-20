@@ -54,7 +54,7 @@ AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 print("Loading model...", flush=True)
-model = SentenceTransformer(MODEL_DIR, device="cpu", config_kwargs={"audio_config": None})
+model = SentenceTransformer(MODEL_DIR, device="cuda", config_kwargs={"audio_config": None})
  
 data = np.load(EMB_FILE)
 ids, vecs = data["ids"], data["vectors"]
@@ -85,7 +85,7 @@ CORS(app, resources={
             "https://sbiswas3011.github.io",
             "http://localhost:5173",
             "http://192.168.29.220:5173",
-            "https://haven-poem-important-philosophy.trycloudflare.com"
+            "https://asin-confidential-donate-below.trycloudflare.com"
         ]
     }
 })
@@ -117,18 +117,18 @@ def prepare_embeddings(embeddings):
 vecs_by_dim = prepare_embeddings(vecs)
 Cvecs_by_dim = prepare_embeddings(Cvecs)
 
-def preprocess_image(image, size="tiny"):
-    image = ImageOps.exif_transpose(image).convert("RGB")
+# def preprocess_image(image, size="tiny"):
+#     image = ImageOps.exif_transpose(image).convert("RGB")
 
-    max_size = IMAGE_SIZES.get(size, 128)
+#     max_size = IMAGE_SIZES.get(size, 128)
 
-    if max_size is not None:
-        image.thumbnail(
-            (max_size, max_size),
-            Image.Resampling.LANCZOS
-        )
+#     if max_size is not None:
+#         image.thumbnail(
+#             (max_size, max_size),
+#             Image.Resampling.LANCZOS
+#         )
 
-    return image
+#     return image
 
 def rank(q="", contrastive=False, image=None, search_id=None, dim=0):
 
@@ -302,16 +302,16 @@ def search():
         q = request.form.get("q", "").strip()
 
         if search_id is None and "image" in request.files:
-            size = request.form.get("size", "tiny").lower()
+            # size = request.form.get("size", "tiny").lower()
 
-            if size not in IMAGE_SIZES:
-                return jsonify(error="Invalid image size"), 400
+            # if size not in IMAGE_SIZES:
+            #     return jsonify(error="Invalid image size"), 400
 
             try:
                 image = Image.open(
                     request.files["image"].stream
                 )
-                image = preprocess_image(image, size)
+                # image = preprocess_image(image, size)
             except Exception:
                 return jsonify(error="Invalid image file"), 400
             
@@ -324,8 +324,6 @@ def search():
         return jsonify(total=0, results=[])
 
     dim = int(request.args.get("dim", 0))
-
-    # print("DIM:", dim)
 
     if not 0 <= dim < len(EMBED_DIMS):
         return jsonify(error="Invalid dimension"), 400

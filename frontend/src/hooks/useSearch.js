@@ -11,7 +11,7 @@ export function useSearch() {
   const requestId = useRef(0); // ignore responses from outdated searches
   const imageRef = useRef(null);
 
-  const run = useCallback(async (q, offset, dim = 0, image = null, searchId = null, size = "tiny") => {
+  const run = useCallback(async (q, offset, dim = 0, image = null, searchId = null) => {
     const id = ++requestId.current;
     setLoading(true);
     setError(null);
@@ -22,7 +22,7 @@ export function useSearch() {
       if (searchId) {
         data = await searchPhotosById(searchId, offset);
       } else if (image) {
-        data = await searchPhotosByImage(image, offset, size, dim);
+        data = await searchPhotosByImage(image, offset, dim);
       } else {
         data = await searchPhotos(q, offset, dim);
       }
@@ -42,20 +42,20 @@ export function useSearch() {
   }, []);
 
   const search = useCallback(
-    (text, dim, size) => {
+    (text, dim) => {
       const q = text.trim();
       if (!q) return;
       setQuery(q);
       setResults([]);
       setTotal(0);
       window.scrollTo(0, 0);
-      run(q, 0, dim, null, null, size);
+      run(q, 0, dim, null, null);
     },
     [run],
   );
 
   const searchImage = useCallback(
-    (file, dim, size) => {
+    (file, dim) => {
       if (!file) return;
 
       imageRef.current = file;
@@ -63,16 +63,16 @@ export function useSearch() {
       setResults([]);
       setTotal(0);
       window.scrollTo(0, 0);
-      run("", 0, dim, file, null, size);
+      run("", 0, dim, file, null);
     },
     [run],
   );
 
-  const loadMore = useCallback((dim, size) => {
+  const loadMore = useCallback((dim) => {
     if (loading || results.length >= total) return;
     // run(query, results.length, imageRef.current);
     console.log("searchId in loadMore:", searchId);
-    run(query, results.length, dim, null, searchId, size);
+    run(query, results.length, dim, null, searchId);
   }, [loading, results.length, total, query, searchId, run]);
 
   return {

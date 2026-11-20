@@ -22,11 +22,11 @@ export async function correctEmbedding(payload) {
   return data;
 }
 
-export async function searchPhotosByImage(file, offset = 0, size = "tiny", dim = 0) {
+export async function searchPhotosByImage(file, offset = 0, dim = 0) {
   const formData = new FormData();
   formData.append("image", file);
   formData.append("offset", offset);
-  formData.append("size", size);
+  // formData.append("size", size);
   // formData.append("dim", dim);
 
   const params = new URLSearchParams({
