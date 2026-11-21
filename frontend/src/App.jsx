@@ -40,6 +40,7 @@ export default function App() {
       const response = await fetch(`${import.meta.env.VITE_API_BASE}/health`, {
         method: "GET",
         mode: "cors",
+        signal: AbortSignal.timeout(1000),
       });
 
       return response.ok;
@@ -75,9 +76,24 @@ export default function App() {
   }, [cameraError]);
 
   useEffect(() => {
-    checkApiConnection().then((connected) => {
-      setApiUnavailable(!connected);
-    });
+    let active = true;
+
+    const check = async () => {
+      const connected = await checkApiConnection();
+
+      if (active) {
+        setApiUnavailable(!connected);
+      }
+    };
+
+    check();
+
+    const interval = setInterval(check, 2000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
   }, []);
 
   return (
@@ -139,7 +155,12 @@ export default function App() {
             </button>
           )}
 
-          <Lightbox photo={selected} query={query} onClose={closeBox} dim={dim} />
+          <Lightbox
+            photo={selected}
+            query={query}
+            onClose={closeBox}
+            dim={dim}
+          />
         </>
       )}
     </>

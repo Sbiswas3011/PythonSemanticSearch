@@ -29,7 +29,7 @@ else:                 # Linux server / Docker
     MODEL_DIR = "/opt/semantic-search/model/embeddinggemma2"
     JPEG_DIR = BASE / "jpegs"
 EMB_FILE = BASE / "embeddings.npz"
-CONTRASTIVE_EMB_FILE = BASE / "contrastive_embeddings.npz"
+CONTRASTIVE_EMB_FILE = BASE / "contrastive_embeddings.npy"
 META_FILE = BASE / "convert_results.jsonl"
 
 DIM = 768      # must match the DIM used when embedding
@@ -42,6 +42,7 @@ IMAGE_SIZES = {
     "original": None,
 }
 EMBED_DIMS = (768, 512, 256, 128)
+IMG_KWARGS = {"image": {"max_soft_tokens": 1120}}
 # ------------------------------
 
 S3_BUCKET = os.environ.get(
@@ -59,16 +60,22 @@ model = SentenceTransformer(MODEL_DIR, device="cuda", config_kwargs={"audio_conf
 data = np.load(EMB_FILE)
 ids, vecs = data["ids"], data["vectors"]
 
-if os.path.exists(CONTRASTIVE_EMB_FILE):
-    dataContrastive = np.load(CONTRASTIVE_EMB_FILE)
-    Cvecs = dataContrastive["vectors"]
+# if os.path.exists(CONTRASTIVE_EMB_FILE):
+#     dataContrastive = np.load(CONTRASTIVE_EMB_FILE)
+#     Cvecs = dataContrastive["vectors"]
+# else:
+#     Cvecs = vecs.copy()
+#     np.savez_compressed(
+#         CONTRASTIVE_EMB_FILE,
+#         ids=ids,
+#         vectors=Cvecs,
+#     )
+
+if CONTRASTIVE_EMB_FILE.exists():
+    Cvecs = np.load(CONTRASTIVE_EMB_FILE, mmap_mode="r+")
 else:
     Cvecs = vecs.copy()
-    np.savez_compressed(
-        CONTRASTIVE_EMB_FILE,
-        ids=ids,
-        vectors=Cvecs,
-    )
+    np.save(CONTRASTIVE_EMB_FILE, Cvecs)
  
 meta = {}
 with open(META_FILE, encoding="utf-8") as f:
@@ -85,7 +92,7 @@ CORS(app, resources={
             "https://sbiswas3011.github.io",
             "http://localhost:5173",
             "http://192.168.29.220:5173",
-            "https://asin-confidential-donate-below.trycloudflare.com"
+            "https://wash-downtown-candidates-minutes.trycloudflare.com"
         ]
     }
 })
@@ -93,7 +100,7 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 lock = threading.Lock()          # the model isn't safe to call from several threads at once
 cache = OrderedDict()            # query -> (order, scores), keeps the last 20 queries
 image_cache = OrderedDict()
-CACHE_MAX = 20
+CACHE_MAX = 1
 
 def prepare_embeddings(embeddings):
     result = {}
@@ -114,23 +121,11 @@ def prepare_embeddings(embeddings):
 
     return result
 
-vecs_by_dim = prepare_embeddings(vecs)
+# vecs_by_dim = prepare_embeddings(vecs)
 Cvecs_by_dim = prepare_embeddings(Cvecs)
+del vecs
 
-# def preprocess_image(image, size="tiny"):
-#     image = ImageOps.exif_transpose(image).convert("RGB")
-
-#     max_size = IMAGE_SIZES.get(size, 128)
-
-#     if max_size is not None:
-#         image.thumbnail(
-#             (max_size, max_size),
-#             Image.Resampling.LANCZOS
-#         )
-
-#     return image
-
-def rank(q="", contrastive=False, image=None, search_id=None, dim=0):
+def rank(q="", image=None, search_id=None, dim=0):
 
     if search_id is not None:
         if search_id not in image_cache:
@@ -140,7 +135,7 @@ def rank(q="", contrastive=False, image=None, search_id=None, dim=0):
         return image_cache[search_id]
     
     # Preserve existing text cache behaviour.
-    cache_key = (q, contrastive, dim) if image is None else None
+    cache_key = (q, dim) if image is None else None
 
     if cache_key is not None and cache_key in cache:
         cache.move_to_end(cache_key)
@@ -177,6 +172,7 @@ def rank(q="", contrastive=False, image=None, search_id=None, dim=0):
             truncate_dim=EMBED_DIMS[dim],
             normalize_embeddings=True,
             convert_to_numpy=True,
+            processing_kwargs=IMG_KWARGS,
         )
         qv += np.asarray(image_vector).reshape(-1)
 
@@ -189,7 +185,7 @@ def rank(q="", contrastive=False, image=None, search_id=None, dim=0):
             prompt_name="SearchQuery",
             truncate_dim=EMBED_DIMS[dim],
             normalize_embeddings=True,
-            convert_to_numpy=True,
+            convert_to_numpy=True
         )
 
         for (_, sig), vector in zip(terms, vectors):
@@ -203,7 +199,7 @@ def rank(q="", contrastive=False, image=None, search_id=None, dim=0):
     qv /= norm
 
     # Choose embedding set.
-    image_vecs = Cvecs_by_dim[EMBED_DIMS[dim]] if contrastive else vecs_by_dim[EMBED_DIMS[dim]]
+    image_vecs = Cvecs_by_dim[EMBED_DIMS[dim]]
 
     scores = image_vecs @ qv
     order = scores.argsort()[::-1]
@@ -281,9 +277,20 @@ def contrastive_update(
     # Cvecs[index] = result.astype(Cvecs.dtype, copy=False)
     Cvecs_by_dim[EMBED_DIMS[search_dim]][index] = result.astype(Cvecs_by_dim[EMBED_DIMS[search_dim]].dtype, copy=False)
 
-    # Cached rankings are now stale.
     with lock:
+        Cvecs[index] = result.astype(Cvecs.dtype, copy=False)
+
+        for dim in EMBED_DIMS[1:]:
+            v = result[:dim].copy()
+            v /= max(np.linalg.norm(v), 1e-8)
+            Cvecs_by_dim[dim][index] = v
+
+        Cvecs_by_dim[768][index] = result
+
+        Cvecs.flush()
+
         cache.clear()
+        image_cache.clear()
 
     return result
  
@@ -328,7 +335,7 @@ def search():
     if not 0 <= dim < len(EMBED_DIMS):
         return jsonify(error="Invalid dimension"), 400
     
-    order, scores = rank(q, True, image=image, search_id=search_id, dim=dim)
+    order, scores = rank(q, image=image, search_id=search_id, dim=dim)
 
     if image is not None and search_id is None:
         search_id = str(uuid.uuid4())
@@ -412,7 +419,7 @@ def correct_image():
         if "+" in correct_text or "-" in correct_text:
             raise ValueError("Correct text cannot contain '+' or '-' characters")
 
-        if not 0 <= index < len(vecs):
+        if not 0 <= index < len(Cvecs):
             return jsonify(error="Invalid embedding index"), 400
 
         # Encode both concepts using the same query pipeline.

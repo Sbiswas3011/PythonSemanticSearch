@@ -8,8 +8,9 @@ shards/*
 
 # Ignore embedding arrays EXCEPT embeddings.npz
 *.npz
+*.npy
 # !embeddings.npz
-# !contrastive_embeddings.npz
+# !contrastive_embeddings.npy
 
 # Generated processing data
 convert_results.jsonl

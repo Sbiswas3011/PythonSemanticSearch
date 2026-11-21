@@ -276,9 +276,20 @@ button:disabled {
 
 .camera video {
   flex: 1 1 auto;
-  min-height: 0; /* lets the video shrink instead of pushing controls off-screen */
+  min-height: 0;
   width: 100%;
   height: 100%;
+  max-height: none;
+  object-fit: contain;
+  display: block;
+  background: #000;
+}
+
+.camera .camera-preview {
+  flex: 1 1 auto;
+  min-height: 0; /* lets the video shrink instead of pushing controls off-screen */
+  width: 100%;
+  height: 0;
   max-height: none;
   object-fit: contain;
   display: block;

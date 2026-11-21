@@ -12,9 +12,13 @@ export default function Camera({
   const streamRef = useRef(null);
   const activeRef = useRef(true);
   const requestRef = useRef(0);
+  const nativeCameraRef = useRef(null);
+  // const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isMobile = false; // Disable mobile camera for testing
 
   const [cameras, setCameras] = useState([]);
   const [selectedCamera, setSelectedCamera] = useState("");
+  const [preview, setPreview] = useState(null);
 
   const qualitySettings = {
     tiny: 0.1,
@@ -104,6 +108,13 @@ export default function Camera({
   useEffect(() => {
     activeRef.current = true;
 
+    if (isMobile) {
+      nativeCameraRef.current?.click();
+      return () => {
+        activeRef.current = false;
+      };
+    }
+
     const initialize = async () => {
       try {
         if (!navigator.mediaDevices?.getUserMedia) {
@@ -155,73 +166,160 @@ export default function Camera({
 
     canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
 
+    // canvas.toBlob(
+    //   (blob) => {
+    //     if (blob) {
+    //       const file = new File([blob], "capture.jpg", {
+    //         type: "image/jpeg",
+    //       });
+
+    //       onImageSearch(file, dim);
+    //       onClose();
+    //     }
+    //   },
+    //   "image/jpeg",
+    //   qualitySettings[quality],
+    // );
+
     canvas.toBlob(
       (blob) => {
-        if (blob) {
-          const file = new File([blob], "capture.jpg", {
-            type: "image/jpeg",
-          });
+        if (!blob) return;
 
-          onImageSearch(file, dim);
-          onClose();
-        }
+        const file = new File([blob], "capture.jpg", {
+          type: "image/jpeg",
+        });
+
+        setPreview({
+          file,
+          url: URL.createObjectURL(blob),
+        });
       },
       "image/jpeg",
       qualitySettings[quality],
     );
   };
 
+  const retakeImage = () => {
+    URL.revokeObjectURL(preview.url);
+    setPreview(null);
+  };
+
+  const submitImage = () => {
+    onImageSearch(preview.file, dim);
+    URL.revokeObjectURL(preview.url);
+    onClose();
+  };
+
+  useEffect(() => {
+    if (!preview && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play();
+    }
+  }, [preview]);
+
+  const handleNativeCapture = (event) => {
+    const file = event.target.files?.[0];
+
+    if (!file) return;
+
+    setPreview({
+      file,
+      url: URL.createObjectURL(file),
+    });
+
+    event.target.value = "";
+  };
+
   return (
     <div className="camera card">
-      <video ref={videoRef} autoPlay playsInline muted />
+      <input
+        ref={nativeCameraRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handleNativeCapture}
+        hidden
+      />
 
-      <div className="camera-controls">
-        {/* Camera selection */}
-        {cameras.length > 1 && (
-          <div className="camera-selection">
-            <label htmlFor="camera-select">Camera</label>
+      {preview ? (
+        <>
+          <img
+            src={preview.url}
+            alt="Captured preview"
+            className="camera-preview"
+          />
 
-            <select
-              id="camera-select"
-              value={selectedCamera}
-              onChange={handleCameraChange}
+          <div className="camera-actions">
+            <button type="button" onClick={submitImage}>
+              Use Photo
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                if (isMobile) {
+                  nativeCameraRef.current?.click();
+                } else {
+                  retakeImage();
+                }
+              }}
             >
-              {cameras.map((camera) => (
-                <option key={camera.deviceId} value={camera.deviceId}>
-                  {camera.label}
-                </option>
-              ))}
-            </select>
+              Retake
+            </button>
           </div>
-        )}
+        </>
+      ) : !isMobile ? (
+        <>
+          <video ref={videoRef} autoPlay playsInline muted />
 
-        {/* Image quality */}
-        <div className="quality-control">
-          <div className="quality-options">
-            {["tiny", "small", "medium", "large", "original"].map((option) => (
-              <button
-                key={option}
-                type="button"
-                className={quality === option ? "active" : ""}
-                onClick={() => setQuality(option)}
-              >
-                {option.charAt(0).toUpperCase() + option.slice(1)}
+          <div className="camera-controls">
+            {cameras.length > 1 && (
+              <div className="camera-selection">
+                <label htmlFor="camera-select">Camera</label>
+
+                <select
+                  id="camera-select"
+                  value={selectedCamera}
+                  onChange={handleCameraChange}
+                >
+                  {cameras.map((camera) => (
+                    <option key={camera.deviceId} value={camera.deviceId}>
+                      {camera.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <div className="quality-control">
+              <div className="quality-options">
+                {["tiny", "small", "medium", "large", "original"].map(
+                  (option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      className={quality === option ? "active" : ""}
+                      onClick={() => setQuality(option)}
+                    >
+                      {option.charAt(0).toUpperCase() + option.slice(1)}
+                    </button>
+                  ),
+                )}
+              </div>
+            </div>
+
+            <div className="camera-actions">
+              <button type="button" onClick={captureImage}>
+                Capture
               </button>
-            ))}
+
+              <button type="button" onClick={onClose}>
+                Cancel
+              </button>
+            </div>
           </div>
-        </div>
-
-        {/* Actions */}
-        <div className="camera-actions">
-          <button type="button" onClick={captureImage}>
-            Capture
-          </button>
-
-          <button type="button" onClick={onClose}>
-            Cancel
-          </button>
-        </div>
-      </div>
+        </>
+      ) : null}
     </div>
   );
 }
