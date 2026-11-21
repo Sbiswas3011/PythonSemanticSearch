@@ -21,11 +21,9 @@ export default function Camera({
   const [preview, setPreview] = useState(null);
 
   const qualitySettings = {
-    tiny: 0.1,
-    small: 0.3,
-    medium: 0.6,
+    small: 0.6,
     large: 0.9,
-    original: 1.0,
+    max: 1.0,
   };
 
   // Stop the currently active camera
@@ -293,18 +291,16 @@ export default function Camera({
 
             <div className="quality-control">
               <div className="quality-options">
-                {["tiny", "small", "medium", "large", "original"].map(
-                  (option) => (
-                    <button
-                      key={option}
-                      type="button"
-                      className={quality === option ? "active" : ""}
-                      onClick={() => setQuality(option)}
-                    >
-                      {option.charAt(0).toUpperCase() + option.slice(1)}
-                    </button>
-                  ),
-                )}
+                {["small", "large", "max"].map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    className={quality === option ? "active" : ""}
+                    onClick={() => setQuality(option)}
+                  >
+                    {option.charAt(0).toUpperCase() + option.slice(1)}
+                  </button>
+                ))}
               </div>
             </div>
 
