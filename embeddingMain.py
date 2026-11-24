@@ -1,6 +1,8 @@
 import json
 import time
 from pathlib import Path
+import hashlib
+import io
 import numpy as np
 import torch
 from PIL import Image
@@ -12,17 +14,20 @@ import re
 import subprocess
 import uuid
 from collections import Counter
-
+from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 import psycopg
 from dotenv import load_dotenv
 from tqdm import tqdm
 from pgvector.psycopg import register_vector
+import rawpy
+from PIL import Image, ImageOps
 
 load_dotenv()
 
 MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
-JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs")
-VECS_FILE = "embeddings.npz"
+JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs_v2")
+VECS_FILE = "embeddings_new.npz"
 RECORDS_FILE = "convert_results.jsonl"
 DATABASE_URL = os.getenv("DATABASE_URL")
 CHUNK = 128
@@ -41,7 +46,66 @@ FIELDS = ["$Directory/$FileName", "$Model", "$SerialNumber", "$ImageUniqueID",
 SHARD_DIR = Path("shards")
 SHARD_DIR.mkdir(exist_ok=True)
 
-def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,records_file=RECORDS_FILE,vecs_file=VECS_FILE,chunk_size=CHUNK,batch_size=BATCH,dim=DIM,shard_dir=SHARD_DIR):
+SELECT_TEMPLATE = """
+WITH ranked AS (
+    SELECT
+        id,
+        capture_key,
+        path,
+        filename,
+        extension,
+        size,
+        ROW_NUMBER() OVER (
+            PARTITION BY capture_key
+            ORDER BY size DESC, id
+        ) AS rn
+    FROM files
+    WHERE capture_key IS NOT NULL
+      {extra_where}
+)
+SELECT
+    id,
+    capture_key::text AS capture_key,
+    path,
+    filename,
+    extension,
+    size
+FROM ranked
+WHERE rn = 1
+ORDER BY path;
+"""
+
+
+def _fetch(database_url, extra_where=""):
+    sql = SELECT_TEMPLATE.format(extra_where=extra_where)
+
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id": file_id,
+            "capture_key": capture_key,
+            "output_id": capture_key,
+            "src": path,
+            "filename": filename,
+            "extension": extension,
+            "size": size,
+        }
+        for file_id, capture_key, path, filename, extension, size in rows
+    ]
+
+def fetch_unembedded_candidates(database_url):
+    """One file per capture_key (largest), only where embedding IS NULL."""
+    return _fetch(database_url, "AND embedding IS NULL")
+
+def fetch_all_candidates(database_url):
+    """One file per capture_key (largest), regardless of embedding."""
+    return _fetch(database_url)
+
+def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATABASE_URL,vecs_file=VECS_FILE,chunk_size=CHUNK,batch_size=BATCH,dim=DIM,shard_dir=SHARD_DIR):
     # 1. Load the model
     dtype = (
         torch.bfloat16
@@ -57,32 +121,27 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,records_file=RECOR
 
     print("device:", model.device, "| dtype:", dtype)
 
-    # 2. Read conversion results and match successful JPEGs
-    records, seen = [], set()
+     # 2. Fetch files from DB and match their extracted JPEGs
+    candidates = fetch_all_candidates(database_url)
 
-    with open(records_file, encoding="utf-8") as f:
-        for line in f:
-            rec = json.loads(line)
+    records = []
 
-            if rec.get("status") != "ok" or not rec.get("jpg"):
-                continue
+    for candidate in candidates:
+        jpg = jpeg_dir / f'{candidate["output_id"]}.jpg'
 
-            if rec["id"] in seen:
-                continue
+        if not jpg.is_file():
+            continue
 
-            jpg = jpeg_dir / rec["jpg"]
-
-            if jpg.is_file():
-                seen.add(rec["id"])
-                records.append({
-                    "id": rec["id"],
-                    "jpg": jpg,
-                    "date": rec.get("date"),
-                    "raw_path": rec.get("raw_path"),
-                })
+        records.append({
+            "id": candidate["id"],
+            "capture_key": candidate["capture_key"],
+            "jpg": jpg,
+            "raw_path": candidate["src"],
+        })
 
     total = len(records)
-    print(total, "successful JPEGs matched")
+
+    print(f"{total:,} database files matched with JPEGs")
     print("cuda available:", torch.cuda.is_available())
     print("torch version:", torch.__version__)
     print("model device:", model.device)
@@ -599,10 +658,290 @@ def store_scan(source, vecs_file=VECS_FILE, database_url=DATABASE_URL):
         f"\nSkipped: {skipped:,}",
         flush=True,
     )
+
+OUT = Path("jpegs_v2")
+RESULTS = Path("extract_results.jsonl")
+
+MAX_SIDE = 1600
+QUALITY = 90
+MIN_NONRAW_SIDE = 512
+THUMB_MIN_SIDE = 1200
+WORKERS = 4
+FETCH = "all"  # "all" or "unembedded"
+
+RETRY_FAILED = False
+FRESH_START = False
+
+RAW_EXTS = {".cr2", ".cr3"}
+ROT = {3: 180, 5: 90, 6: -90}
+
+Image.MAX_IMAGE_PIXELS = None  # trusted local files
+
+def safe_name(value):
+    value = str(value)
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")
+
+    if cleaned != value or not cleaned:
+        cleaned = (cleaned or "x") + "_" + hashlib.sha1(
+            value.encode("utf-8")
+        ).hexdigest()[:6]
+
+    return cleaned
+
+def flatten(img):
+    if img.mode in ("I;16", "I;16L", "I;16B", "I"):
+        arr = np.clip(
+            np.asarray(img).astype(np.float32) / 256,
+            0,
+            255,
+        ).astype(np.uint8)
+        img = Image.fromarray(arr, "L")
+
+    if img.mode in ("RGBA", "LA") or (
+        img.mode == "P" and "transparency" in img.info
+    ):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.getchannel("A"))
+        return bg
+
+    return img.convert("RGB")
+
+class TooSmall(Exception):
+    pass
+
+def load_raw(path):
+    """Return (image, method), where method is 'preview' or 'developed'."""
+    with rawpy.imread(path) as raw:
+        img = None
+        how = "preview"
+
+        try:
+            thumb = raw.extract_thumb()
+
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                img = Image.open(io.BytesIO(thumb.data))
+                img.load()
+                img = img.convert("RGB")
+            else:
+                img = Image.fromarray(thumb.data)
+
+            if raw.sizes.flip in ROT:
+                img = img.rotate(ROT[raw.sizes.flip], expand=True)
+
+            if max(img.size) < THUMB_MIN_SIDE:
+                img = None
+
+        except (
+            rawpy.LibRawNoThumbnailError,
+            rawpy.LibRawUnsupportedThumbnailError,
+        ):
+            img = None
+
+        if img is None:
+            img = Image.fromarray(
+                raw.postprocess(
+                    half_size=True,
+                    use_camera_wb=True,
+                )
+            )
+            how = "developed"
+
+    return img, how
+
+def load_plain(path):
+    with Image.open(path) as im:
+        im.draft("RGB", (MAX_SIDE, MAX_SIDE))
+        img = flatten(ImageOps.exif_transpose(im))
+
+    if max(img.size) < MIN_NONRAW_SIDE:
+        raise TooSmall(f"{img.size[0]}x{img.size[1]}")
+
+    return img, "plain"
+
+def convert_one(candidate, out):
+    path = candidate["src"]
+
+    output_name = safe_name(candidate["output_id"]) + ".jpg"
+    output_path = out / output_name
+
+    errors = []
+
+    if not os.path.exists(path):
+        errors.append({"path": path, "error": "not found"})
+        status = "unavailable"
+    else:
+        try:
+            suffix = Path(path).suffix.lower()
+
+            if suffix in RAW_EXTS:
+                img, how = load_raw(path)
+            else:
+                img, how = load_plain(path)
+
+            img.thumbnail((MAX_SIDE, MAX_SIDE))
+
+            tmp_path = output_path.with_name(output_name + ".tmp")
+            img.save(tmp_path, format="JPEG", quality=QUALITY)
+            tmp_path.replace(output_path)
+
+            return {
+                "id": candidate["id"],
+                "capture_key": candidate["capture_key"],
+                "output_id": candidate["output_id"],
+                "status": "ok",
+                "jpg": output_name,
+                "used": path,
+                "how": how,
+                "errors": errors,
+            }
+
+        except TooSmall as exc:
+            status = "too_small"
+            errors.append({"path": path, "error": f"too_small: {exc}"})
+
+        except Exception as exc:
+            status = "failed"
+            errors.append({
+                "path": path,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    return {
+        "id": candidate["id"],
+        "capture_key": candidate["capture_key"],
+        "output_id": candidate["output_id"],
+        "status": status,
+        "jpg": None,
+        "used": None,
+        "errors": errors,
+    }
+
+def load_last_results(results):
+    last = {}
+
+    if results.exists():
+        with open(results, "r", encoding="utf-8") as log:
+            for line in log:
+                if line.strip():
+                    result = json.loads(line)
+                    last[result["output_id"]] = result
+
+    return last
+
+def finished(candidate, last, out):
+    result = last.get(candidate["output_id"])
+
+    if result is None:
+        return False
+
+    status = result["status"]
+
+    if status == "ok":
+        return bool(result.get("jpg")) and (out / result["jpg"]).exists()
+
+    if status == "unavailable" or (
+        status in ("failed", "too_small") and RETRY_FAILED
+    ):
+        return False
+
+    return True
+
+def extract_images(
+    database_url=DATABASE_URL,
+    fresh_start=FRESH_START,
+    out=OUT,
+    results=RESULTS,
+    fetch=FETCH,
+):
+    if not database_url:
+        raise ValueError(
+            "Set DATABASE_URL, for example:\n"
+            "DATABASE_URL=postgres://user:password@localhost:5432/photo_search"
+        )
+
+    out = Path(out)
+    results = Path(results)
+    out.mkdir(parents=True, exist_ok=True)
+
+    if fresh_start:
+        results.write_text("", encoding="utf-8")
+        for path in list(out.glob("*.jpg")) + list(out.glob("*.tmp")):
+            path.unlink()
+
+    print("Fetching extraction candidates from PostgreSQL...", flush=True)
+    if fetch == "unembedded":
+        manifest = fetch_unembedded_candidates(database_url)
+    elif fetch == "all":
+        manifest = fetch_all_candidates(database_url)
+    print(f"{len(manifest):,} candidate images selected", flush=True)
+
+    last = load_last_results(results)
+
+    pending = [
+        candidate
+        for candidate in manifest
+        if not finished(candidate, last, out)
+    ]
+    pending.sort(key=lambda candidate: candidate["src"].lower())
+
+    print(
+        f"{len(pending):,} to extract, "
+        f"{len(manifest) - len(pending):,} already done or skipped",
+        flush=True,
+    )
+
+    counts = {}
+    convert = partial(convert_one, out=out)
+
+    with (
+        open(results, "a", encoding="utf-8") as log,
+        ThreadPoolExecutor(max_workers=WORKERS) as executor,
+        tqdm(total=len(pending), unit="img") as bar,
+    ):
+        for start in range(0, len(pending), 256):
+            chunk = pending[start:start + 256]
+
+            for result in executor.map(convert, chunk):
+                log.write(json.dumps(result, ensure_ascii=False) + "\n")
+                log.flush()
+
+                last[result["output_id"]] = result
+                counts[result["status"]] = (
+                    counts.get(result["status"], 0) + 1
+                )
+                bar.update(1)
+
+    totals = {}
+    for result in last.values():
+        totals[result["status"]] = totals.get(result["status"], 0) + 1
+
+    print("This run:", counts or "nothing to do")
+    print("Overall:", totals, "->", results)
+
+OUT = Path("jpegs_v2")
+RESULTS = Path("extract_results.jsonl")
+
+MAX_SIDE = 1600
+QUALITY = 90
+MIN_NONRAW_SIDE = 512
+THUMB_MIN_SIDE = 1200
+WORKERS = 4
+FETCH = "all"  # "all" or "unembedded"
+
+RETRY_FAILED = False
+FRESH_START = False
+
+RAW_EXTS = {".cr2", ".cr3"}
+ROT = {3: 180, 5: 90, 6: -90}
+
+Image.MAX_IMAGE_PIXELS = None  # trusted local files
+
 # order here = order they run in
 STEPS = {
     "scan": scan_drive,
     "store": store_scan,
+    "extract": extract_images,
     "gen": generate_embeddings,
     "check_s": check_shards,
     "merge_s": merge_shards,

@@ -29,3 +29,5 @@ scan_summary.json
 
 .env
 *.txt
+jpegs_v2/*
+extract_results.jsonl
