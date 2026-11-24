@@ -7,16 +7,36 @@ from PIL import Image
 from sentence_transformers import SentenceTransformer
 import argparse, inspect
 import sys
+import os
+import re
+import subprocess
+import uuid
+from collections import Counter
+
+import psycopg
+from dotenv import load_dotenv
+from tqdm import tqdm
+from pgvector.psycopg import register_vector
+
+load_dotenv()
 
 MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
 JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs")
 VECS_FILE = "embeddings.npz"
 RECORDS_FILE = "convert_results.jsonl"
+DATABASE_URL = os.getenv("DATABASE_URL")
 CHUNK = 128
 DIM = 768
 BATCH = 8
 IMG_KWARGS = {"image": {"max_soft_tokens": 1120}}
 QUERY = "a flamingo flying alone"
+
+NS = uuid.UUID("6f1c0d2e-0000-4000-8000-000000000001")  # never change this once used
+EXTENSIONS = ["jpg", "jpeg", "cr2", "cr3"]
+IGNORE_DIRS = ["$RECYCLE.BIN", "System Volume Information"]
+FIELDS = ["$Directory/$FileName", "$Model", "$SerialNumber", "$ImageUniqueID",
+          "$LensSerialNumber", "$SubSecDateTimeOriginal", "$OriginalDocumentID",
+          "$DocumentID", "$InstanceID"]
 
 SHARD_DIR = Path("shards")
 SHARD_DIR.mkdir(exist_ok=True)
@@ -336,8 +356,253 @@ def check_shards(shard_dir=SHARD_DIR, dim=DIM):
         "empty": empty,
     }
 
+def normalize_source(source):
+    source = source.replace("\\", "/")
+    return source if source.endswith("/") else source + "/"
+
+def scan_drive(source, out_file, err_file):
+    """Run exiftool over the drive. Returns exiftool's exit code."""
+    source = normalize_source(source)
+    if not os.path.exists(source):
+        raise FileNotFoundError(f"{source} not found, nothing scanned.")
+
+    cmd = ["exiftool", "-r", "-fast"]
+    for ext in EXTENSIONS:
+        cmd += ["-ext", ext]
+    for d in IGNORE_DIRS:
+        cmd += ["-i", d]
+    cmd += ["-q", "-f", "-p", "|".join(FIELDS), source]
+
+    with open(out_file, "wb") as out, open(err_file, "wb") as err:
+        return subprocess.run(cmd, stdout=out, stderr=err).returncode
+
+def clean(value):
+    """Convert ExifTool's missing-value markers into None."""
+    value = value.strip().strip("*")
+    return None if value in ("", "-") else value
+
+def get_capture_key(image_uid, model, serial, timestamp):
+    if image_uid:
+        key = f"image:{image_uid}"
+
+    elif model and serial and timestamp:
+        key = f"camera:{model}|serial:{serial}|time:{timestamp}"
+
+    else:
+        return None
+
+    return uuid.uuid5(uuid.NAMESPACE_URL, key)
+
+def load_embedding_lookup(npz_path):
+    if not npz_path or not os.path.isfile(npz_path):
+        print(f"Embeddings file not found: {npz_path}. Skipping embedding import.")
+        return {}
+
+    data = np.load(npz_path, allow_pickle=True)
+
+    ids = data["ids"]
+    vectors = data["vectors"]
+
+    lookup = {}
+
+    for i, value in enumerate(ids):
+        parts = str(value).rsplit("__", 1)
+        if len(parts) != 2:
+            continue
+
+        filename, size = parts
+
+        try:
+            key = (filename, int(size))
+        except ValueError:
+            continue
+
+        lookup[key] = np.asarray(vectors[i], dtype=np.float32)
+
+    return lookup
+
+def store_scan(source, vecs_file=VECS_FILE, database_url=DATABASE_URL):
+    if not database_url:
+        raise ValueError("Provide --database-url or set DATABASE_URL")
+
+    embedding_lookup = load_embedding_lookup(vecs_file)
+
+    sql = """
+        INSERT INTO files (
+            drive_id,
+            path,
+            filename,
+            extension,
+            size,
+            mtime_ns,
+            model,
+            serial_number,
+            image_unique_id,
+            lens_serial_number,
+            subsec_datetime_original,
+            original_document_id,
+            document_id,
+            instance_id,
+            capture_key,
+            tracking,
+            embedding,
+            contrastive_embedding
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s
+        )
+        ON CONFLICT (path) DO UPDATE SET
+            drive_id = EXCLUDED.drive_id,
+            filename = EXCLUDED.filename,
+            extension = EXCLUDED.extension,
+            size = EXCLUDED.size,
+            mtime_ns = EXCLUDED.mtime_ns,
+            model = EXCLUDED.model,
+            serial_number = EXCLUDED.serial_number,
+            image_unique_id = EXCLUDED.image_unique_id,
+            lens_serial_number = EXCLUDED.lens_serial_number,
+            subsec_datetime_original = EXCLUDED.subsec_datetime_original,
+            original_document_id = EXCLUDED.original_document_id,
+            document_id = EXCLUDED.document_id,
+            instance_id = EXCLUDED.instance_id,
+            capture_key = EXCLUDED.capture_key,
+            tracking = EXCLUDED.tracking,
+            embedding = COALESCE(EXCLUDED.embedding, files.embedding),
+            contrastive_embedding = COALESCE(EXCLUDED.contrastive_embedding, files.contrastive_embedding),
+            status = 'present',
+            last_seen = NOW()
+    """
+
+    batch = []
+    inserted = 0
+    matched = 0
+    unmatched = 0
+    skipped = 0
+    batch_size = 1000
+
+    with psycopg.connect(database_url) as conn:
+        register_vector(conn)
+
+        with conn.cursor() as cur:
+            with open(source, "r", encoding="utf-8", errors="replace") as f:
+
+                for line_no, line in enumerate(f, 1):
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    fields = line.split("|", 8)
+
+                    if len(fields) != 9:
+                        print(f"Invalid line {line_no}: expected 9 fields")
+                        skipped += 1
+                        continue
+
+                    (
+                        path,
+                        model,
+                        serial,
+                        image_uid,
+                        lens_serial,
+                        timestamp,
+                        original_document_id,
+                        document_id,
+                        instance_id,
+                    ) = [clean(x) for x in fields]
+
+                    try:
+                        stat = os.stat(path)
+                    except OSError as e:
+                        print(f"Cannot stat {path}: {e}")
+                        skipped += 1
+                        continue
+
+                    filename = os.path.basename(path)
+                    filename, ext = os.path.splitext(filename)
+                    extension = ext.lower().lstrip(".")
+
+                    drive_id = (
+                        os.path.splitdrive(path)[0]
+                        .upper()
+                        .rstrip(":")
+                    )
+
+                    capture_key = get_capture_key(
+                        image_uid,
+                        model,
+                        serial,
+                        timestamp
+                    )
+
+                    tracking = capture_key is not None
+
+                    # Match using filename + actual filesystem size
+                    embedding = embedding_lookup.get(
+                        (filename, stat.st_size)
+                    )
+
+                    if embedding is not None:
+                        embedding = np.asarray(
+                            embedding, dtype=np.float32
+                        )
+                        matched += 1
+                    else:
+                        unmatched += 1
+
+                    batch.append((
+                        drive_id,
+                        path,
+                        filename,
+                        extension,
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        model,
+                        serial,
+                        image_uid,
+                        lens_serial,
+                        timestamp,
+                        original_document_id,
+                        document_id,
+                        instance_id,
+                        capture_key,
+                        tracking,
+                        embedding,
+                        embedding  # Store the same embedding in both columns for now
+                    ))
+
+                    if len(batch) >= batch_size:
+                        cur.executemany(sql, batch)
+                        inserted += len(batch)
+                        conn.commit()
+                        batch.clear()
+
+                        print(
+                            f"Stored: {inserted:,} | "
+                            f"Embedding matches: {matched:,} | "
+                            f"No match: {unmatched:,}",
+                            flush=True
+                        )
+
+            if batch:
+                cur.executemany(sql, batch)
+                inserted += len(batch)
+                conn.commit()
+
+    print(
+        f"\nScan storage complete."
+        f"\nStored: {inserted:,}"
+        f"\nEmbedding matches: {matched:,}"
+        f"\nNo embedding match: {unmatched:,}"
+        f"\nSkipped: {skipped:,}",
+        flush=True,
+    )
 # order here = order they run in
 STEPS = {
+    "scan": scan_drive,
+    "store": store_scan,
     "gen": generate_embeddings,
     "check_s": check_shards,
     "merge_s": merge_shards,
@@ -373,9 +638,10 @@ def main(argv=None):
         return 1
 
     for name in selected:
-        print(f"\n=== {name} ===", flush=True)
+        print(f"\n=== performing {name} ===", flush=True)
         params = inspect.signature(STEPS[name]).parameters
         kwargs = {k: v for k, v in vars(args).items() if k in params and v is not None}
+        print(f"\n=== {name} completed ===", flush=True)
         STEPS[name](**kwargs)
     return 0
 

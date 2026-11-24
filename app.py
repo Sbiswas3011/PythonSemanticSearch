@@ -75,7 +75,8 @@ if CONTRASTIVE_EMB_FILE.exists():
     Cvecs = np.load(CONTRASTIVE_EMB_FILE, mmap_mode="r+")
 else:
     Cvecs = vecs.copy()
-    np.save(CONTRASTIVE_EMB_FILE, Cvecs)
+    np.save(CONTRASTIVE_EMB_FILE, Cvecs) 
+del vecs
  
 meta = {}
 with open(META_FILE, encoding="utf-8") as f:
@@ -83,7 +84,7 @@ with open(META_FILE, encoding="utf-8") as f:
         r = json.loads(line)
         meta[r["id"]] = r
  
-print(f"{len(ids)} images loaded.", flush=True)
+print(f"{len(ids)} Image Ids loaded.", flush=True)
  
 app = Flask(__name__)
 CORS(app, resources={
@@ -92,7 +93,7 @@ CORS(app, resources={
             "https://sbiswas3011.github.io",
             "http://localhost:5173",
             "http://192.168.29.220:5173",
-            "https://wash-downtown-candidates-minutes.trycloudflare.com"
+            "https://followed-imposed-cabinet-pending.trycloudflare.com"
         ]
     }
 })
@@ -123,7 +124,6 @@ def prepare_embeddings(embeddings):
 
 # vecs_by_dim = prepare_embeddings(vecs)
 Cvecs_by_dim = prepare_embeddings(Cvecs)
-del vecs
 
 def rank(q="", image=None, search_id=None, dim=0):
 
@@ -214,7 +214,6 @@ def rank(q="", image=None, search_id=None, dim=0):
             cache.popitem(last=False)
 
     return result
-
 
 def contrastive_update(
     index,
@@ -459,6 +458,15 @@ def correct_image():
 
     except (KeyError, ValueError, TypeError) as e:
         return jsonify(error=str(e)), 400
+
+print("Warming up...", flush=True)
+with lock:
+    model.encode(["warmup"], prompt_name="SearchQuery",
+                 truncate_dim=EMBED_DIMS[0], convert_to_numpy=True)
+    dummy = Image.new("RGB", (512, 512), (128, 128, 128))
+    model.encode({"image": dummy}, truncate_dim=EMBED_DIMS[0],
+                 convert_to_numpy=True, processing_kwargs=IMG_KWARGS)
+print("Ready.", flush=True)
 
 if __name__ == "__main__":
     # 127.0.0.1 = reachable only from this computer

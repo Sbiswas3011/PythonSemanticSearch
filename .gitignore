@@ -28,4 +28,4 @@ scan_summary.json
 .vscode
 
 .env
-ids.txt
+*.txt
