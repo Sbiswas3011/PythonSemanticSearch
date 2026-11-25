@@ -13,7 +13,10 @@ import re, os
 from flask_cors import CORS
 from botocore.exceptions import ClientError
 import boto3
-from PIL import Image, ImageOps
+from PIL import Image
+import psycopg
+from pgvector.psycopg import register_vector
+
  
 # ---------- settings ----------
 BASE = Path(__file__).parent
@@ -31,7 +34,7 @@ else:                 # Linux server / Docker
 EMB_FILE = BASE / "embeddings.npz"
 CONTRASTIVE_EMB_FILE = BASE / "contrastive_embeddings.npy"
 META_FILE = BASE / "convert_results.jsonl"
-
+DATABASE_URL = os.environ["DATABASE_URL"]
 DIM = 768      # must match the DIM used when embedding
 PAGE = 24      # results per page
 IMAGE_SIZES = {

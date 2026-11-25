@@ -15,13 +15,17 @@ import subprocess
 import uuid
 from collections import Counter
 from functools import partial
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor,as_completed
 import psycopg
 from dotenv import load_dotenv
 from tqdm import tqdm
 from pgvector.psycopg import register_vector
 import rawpy
 from PIL import Image, ImageOps
+
+import boto3
+from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
 
 load_dotenv()
 
@@ -44,7 +48,9 @@ FIELDS = ["$Directory/$FileName", "$Model", "$SerialNumber", "$ImageUniqueID",
           "$DocumentID", "$InstanceID"]
 
 SHARD_DIR = Path("shards")
-SHARD_DIR.mkdir(exist_ok=True)
+# SHARD_DIR.mkdir(exist_ok=True)
+BUCKET="thumbnail-s3-semanticsearch"
+PREFIX="jpegs_v2"
 
 SELECT_TEMPLATE = """
 WITH ranked AS (
@@ -105,7 +111,38 @@ def fetch_all_candidates(database_url):
     """One file per capture_key (largest), regardless of embedding."""
     return _fetch(database_url)
 
-def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATABASE_URL,vecs_file=VECS_FILE,chunk_size=CHUNK,batch_size=BATCH,dim=DIM,shard_dir=SHARD_DIR):
+def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATABASE_URL,vecs_file=VECS_FILE,chunk_size=CHUNK,batch_size=BATCH,dim=DIM,shard_dir=SHARD_DIR,overwrite=False):
+
+    #TODO: handle case of interrupted failed logs not printing
+    #TODO: handle capture key as well in shards
+
+    # 0. Prepare directories
+    jpeg_dir = Path(jpeg_dir)
+    shard_dir = Path(shard_dir)
+    vecs_file = Path(vecs_file)
+
+    if not jpeg_dir.is_dir():
+        raise FileNotFoundError(
+            f"{jpeg_dir} does not exist. Run the extract step first."
+        )
+
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    vecs_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if overwrite:
+        # Remove old shards, including leftover .tmp.npz files from crashes
+        removed = 0
+        for p in shard_dir.glob("shard_*"):
+            if p.is_file():
+                p.unlink()
+                removed += 1
+
+        # Remove old merged output and failure log
+        vecs_file.unlink(missing_ok=True)
+        Path("failed.json").unlink(missing_ok=True)
+
+        print(f"overwrite: removed {removed} old shard files")
+
     # 1. Load the model
     dtype = (
         torch.bfloat16
@@ -181,6 +218,7 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
                 show_progress_bar=False,
                 processing_kwargs=IMG_KWARGS,
             ).astype(np.float32)
+            vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
         else:
             vecs = np.zeros((0, dim), dtype=np.float32)
 
@@ -215,46 +253,77 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
         print(len(failed), "images failed, see failed.json")
 
     # 5. Merge existing shards
-    parts = []
-
-    for p in sorted(shard_dir.glob("shard_*.npz")):
-        with np.load(p, allow_pickle=False) as data:
-            parts.append((data["ids"].copy(), data["vectors"].copy()))
-
-    if not parts:
-        print("No shards available to merge.")
-        return model, records, None
-
-    ids = np.concatenate([p[0] for p in parts])
-    vecs = np.concatenate([p[1] for p in parts])
-
-    np.savez(vecs_file, ids=ids, vectors=vecs)
-
-    print("saved", vecs_file, vecs.shape)
+    merge_shards(
+        shard_dir=shard_dir,
+        vecs_file=vecs_file,
+        database_url=database_url,
+        dim=dim,
+        to_db=True
+    )
 
     return model, records, vecs
 
-def test_search(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,records_file=RECORDS_FILE,vecs_file=VECS_FILE,query=QUERY):
-
-    if vecs_file is None:
-        print("No embeddings available.")
-        return
-
-    data = np.load(vecs_file)
+def _hits_from_file(q, vecs_file, top_k):
+    data = np.load(vecs_file, allow_pickle=False)
     ids, vecs = data["ids"], data["vectors"]
+    scores = (vecs @ q) / (np.linalg.norm(vecs, axis=1) * np.linalg.norm(q))
+    order = scores.argsort()[::-1][:top_k]
+    return [(ids[i].item(), float(scores[i])) for i in order]
+
+def _hits_from_db(q, database_url, top_k):
+    sql = """
+        SELECT id, capture_key::text, path, 1 - (embedding <=> %s) AS score
+        FROM files
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <=> %s
+        LIMIT %s
+    """
+    with psycopg.connect(database_url) as conn:
+        register_vector(conn)
+        # over-fetch: siblings share one embedding, so they come back as ties
+        rows = conn.execute(sql, (q, q, top_k * 10)).fetchall()
+
+    seen, hits = set(), []
+    for file_id, capture_key, path, score in rows:
+        key = capture_key or file_id
+        if key in seen:
+            continue
+        seen.add(key)
+        hits.append((file_id, float(score), capture_key, path))
+        if len(hits) == top_k:
+            break
+    return hits
+
+def _lookup(database_url, ids):
+    """files.id -> (capture_key, path)"""
+    with psycopg.connect(database_url) as conn:
+        rows = conn.execute(
+            "SELECT id, capture_key::text, path FROM files WHERE id = ANY(%s)",
+            (list(ids),),
+        ).fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+def test_search(model_dir=MODEL_DIR, jpeg_dir=JPEG_DIR, vecs_file=VECS_FILE, database_url=DATABASE_URL, query=QUERY, mode="both", top_k=5):
+    """mode: 'db', 'file', or 'both' (compares the two)."""
+    if mode not in ("db", "file", "both"):
+        raise ValueError("mode must be 'db', 'file' or 'both'")
+    if not database_url:
+        raise ValueError("Provide --database-url or set DATABASE_URL")
+
+    jpeg_dir = Path(jpeg_dir)
+    if mode in ("file", "both") and not Path(vecs_file).is_file():
+        raise FileNotFoundError(f"{vecs_file} not found. Run the merge step first.")
 
     dtype = (
-            torch.bfloat16
-            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-            else torch.float32
-        )
-    
+        torch.bfloat16
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        else torch.float32
+    )
     model = SentenceTransformer(
         model_dir,
         config_kwargs={"audio_config": None},
         model_kwargs={"torch_dtype": dtype},
     )
-
     print("device:", model.device, "| dtype:", dtype)
 
     q = model.encode(
@@ -262,107 +331,167 @@ def test_search(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,records_file=RECORDS_FILE,
         prompt_name="SearchQuery",
         truncate_dim=DIM,
         normalize_embeddings=True,
+    ).astype(np.float32)
+    q /= np.linalg.norm(q)
+
+    print(f'\nquery: "{query}"')
+    results = {}   # label -> list of (id, score, capture_key, path)
+
+    if mode in ("db", "both"):
+        results["db"] = _hits_from_db(q, database_url, top_k)
+
+    if mode in ("file", "both"):
+        raw = _hits_from_file(q, vecs_file, top_k)
+        meta = _lookup(database_url, [i for i, _ in raw])
+        results["file"] = [
+            (i, s, *meta.get(i, (None, None))) for i, s in raw
+        ]
+
+    for label, hits in results.items():
+        print(f"\n--- {label} ---")
+        for file_id, score, capture_key, path in hits:
+            jpg = jpeg_dir / f"{capture_key}.jpg" if capture_key else None
+            print(
+                f"{score:.3f}  id={file_id}  {path}"
+                f"{'' if jpg and jpg.is_file() else '  [jpg missing]'}"
+            )
+
+    if mode == "both":
+        db_keys = {h[2] for h in results["db"]}
+        file_keys = {h[2] for h in results["file"]}
+        print(f"\noverlap in top {top_k}: {len(db_keys & file_keys)}/{top_k}")
+
+def merge_shards(shard_dir=SHARD_DIR, vecs_file=VECS_FILE, database_url=DATABASE_URL, dim=DIM, to_db=True):
+
+    #TODO: handle capture key as well in shards maybe using a db call to recitfy current
+
+    # 0. Prepare paths
+    shard_dir = Path(shard_dir)
+    vecs_file = Path(vecs_file)
+
+    if not shard_dir.is_dir():
+        raise FileNotFoundError(f"{shard_dir} does not exist, nothing to merge.")
+
+    vecs_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if to_db and not database_url:
+        raise ValueError("Provide --database-url or set DATABASE_URL (or use to_db=False)")
+
+    # 1. Collect shards, skipping leftover temp files from crashes
+    shards = sorted(
+        p for p in shard_dir.glob("shard_*.npz")
+        if not p.name.endswith(".tmp.npz")
     )
-
-    records, seen = [], set()
-    
-    with open(records_file, encoding="utf-8") as f:
-        for line in f:
-            rec = json.loads(line)
-
-            if rec.get("status") != "ok" or not rec.get("jpg"):
-                continue
-
-            if rec["id"] in seen:
-                continue
-
-            jpg = jpeg_dir / rec["jpg"]
-
-            if jpg.is_file():
-                seen.add(rec["id"])
-                records.append({
-                    "id": rec["id"],
-                    "jpg": jpg,
-                    "date": rec.get("date"),
-                    "raw_path": rec.get("raw_path"),
-                })
-
-    scores = vecs @ q
-
-    # Match IDs to metadata by ID instead of assuming array positions match.
-    record_by_id = {r["id"]: r for r in records}
-    ids = np.load("embeddings.npz", allow_pickle=False)["ids"]
-
-    for i in scores.argsort()[::-1][:5]:
-        rec = record_by_id.get(str(ids[i]), {})
-
-        print(
-            round(float(scores[i]), 3),
-            ids[i],
-            rec.get("date"),
-            rec.get("raw_path"),
-        )
-
-def merge_shards(shard_dir=SHARD_DIR, vecs_file=VECS_FILE):  
-    shards = sorted(Path(shard_dir).glob("shard_*.npz"))
 
     if not shards:
         print("No shards found.")
         return
 
+    # 2. Load and validate
     ids, vecs = [], []
 
     for shard in shards:
         with np.load(shard, allow_pickle=False) as p:
-            ids.append(p["ids"].copy())
-            vecs.append(p["vectors"].copy())
+            s_ids = p["ids"].copy()
+            s_vecs = p["vectors"].copy()
+
+        if s_vecs.shape != (len(s_ids), dim):
+            raise ValueError(f"{shard.name}: ids {len(s_ids)}, vectors {s_vecs.shape}, expected dim {dim}")
+
+        if len(s_ids):
+            ids.append(s_ids)
+            vecs.append(s_vecs.astype(np.float32))
+
+    if not ids:
+        print("All shards are empty.")
+        return
 
     all_ids = np.concatenate(ids)
     all_vecs = np.concatenate(vecs)
 
-    np.savez(
-        vecs_file,
-        ids=all_ids,
-        vectors=all_vecs,
-    )
+    # 3. Dedupe by id, keeping the LAST occurrence (newest shard wins)
+    latest = {}
+    for pos, file_id in enumerate(all_ids.tolist()):
+        latest[file_id] = pos          # later positions overwrite earlier ones
 
-    print(
-        f"Saved {len(all_ids)} embeddings to {vecs_file}"
-    )
+    if len(latest) != len(all_ids):
+        print(f"dropped {len(all_ids) - len(latest)} duplicate ids")
+        keep = sorted(latest.values())
+        all_ids, all_vecs = all_ids[keep], all_vecs[keep]
+
+    all_vecs /= np.linalg.norm(all_vecs, axis=1, keepdims=True)
+
+    # 4. Write the merged file atomically
+    tmp = vecs_file.with_name(vecs_file.name + ".tmp.npz")
+    with open(tmp, "wb") as f:
+        np.savez(f, ids=all_ids, vectors=all_vecs)
+    tmp.replace(vecs_file)
+
+    print(f"Saved {len(all_ids):,} embeddings to {vecs_file}")
+
+    # 5. Write to the database (representative + all siblings sharing its capture_key)
+    if not to_db:
+        return
+
+    sql = """
+        UPDATE files
+        SET embedding = %s,
+            contrastive_embedding = %s
+        WHERE capture_key = (SELECT capture_key FROM files WHERE id = %s)
+    """
+
+    id_list = all_ids.tolist()   # numpy ints/strings -> plain Python values
+
+    with psycopg.connect(database_url) as conn:
+        register_vector(conn)
+        with conn.cursor() as cur:
+            for start in range(0, len(id_list), 1000):
+                end = start + 1000
+                cur.executemany(
+                    sql,
+                    [(all_vecs[i], all_vecs[i], id_list[i]) for i in range(start, min(end, len(id_list)))],
+                )
+                conn.commit()
+                print(f"DB: {min(end, len(id_list)):,}/{len(id_list):,}", flush=True)
+
+    print("Database updated.")
 
 def check_shards(shard_dir=SHARD_DIR, dim=DIM):
+    shard_dir = Path(shard_dir)
+
+    if not shard_dir.is_dir():
+        raise FileNotFoundError(f"{shard_dir} does not exist")
+
     checked = 0
     valid = 0
     corrupted = []
     invalid_shape = []
     empty = []
+    duplicates = []      # (id, first_shard, later_shard)
+    seen = {}            # id -> name of the first shard it appeared in
 
-    for shard in sorted(Path(shard_dir).glob("shard_*.npz")):
+    shards = sorted(p for p in shard_dir.glob("shard_*.npz") if not p.name.endswith(".tmp.npz"))
+    leftovers = sorted(p.name for p in shard_dir.glob("shard_*.tmp.npz"))
+
+    for shard in shards:
         checked += 1
 
         try:
             with np.load(shard, allow_pickle=False) as data:
                 if "ids" not in data or "vectors" not in data:
-                    corrupted.append(
-                        (shard.name, "Missing ids or vectors")
-                    )
+                    corrupted.append((shard.name, "Missing ids or vectors"))
                     continue
 
                 ids = data["ids"]
                 vectors = data["vectors"]
 
                 if ids.ndim != 1:
-                    invalid_shape.append(
-                        (shard.name, f"IDs shape: {ids.shape}")
-                    )
+                    invalid_shape.append((shard.name, f"IDs shape: {ids.shape}"))
                     continue
 
                 if vectors.shape != (len(ids), dim):
                     invalid_shape.append(
-                        (
-                            shard.name,
-                            f"IDs: {len(ids)}, vectors: {vectors.shape}",
-                        )
+                        (shard.name, f"IDs: {len(ids)}, vectors: {vectors.shape}")
                     )
                     continue
 
@@ -373,13 +502,19 @@ def check_shards(shard_dir=SHARD_DIR, dim=DIM):
                     continue
 
                 if not np.isfinite(vectors).all():
-                    invalid_shape.append(
-                        (shard.name, "NaN or infinite values")
-                    )
+                    invalid_shape.append((shard.name, "NaN or infinite values"))
                     continue
 
                 if len(ids) == 0:
                     empty.append(shard.name)
+                    continue          # empty is not an error, but not "valid" either
+
+                # Duplicate check: only for shards that passed everything above
+                for file_id in ids.tolist():
+                    if file_id in seen:
+                        duplicates.append((file_id, seen[file_id], shard.name))
+                    else:
+                        seen[file_id] = shard.name
 
                 valid += 1
 
@@ -391,6 +526,8 @@ def check_shards(shard_dir=SHARD_DIR, dim=DIM):
     print(f"Corrupted/unreadable: {len(corrupted)}")
     print(f"Invalid contents/shapes: {len(invalid_shape)}")
     print(f"Empty shards: {len(empty)}")
+    print(f"Duplicate ids across shards: {len(duplicates)}")
+    print(f"Leftover temp files: {len(leftovers)}")
 
     if corrupted:
         print("\n--- CORRUPTED / UNREADABLE ---")
@@ -403,8 +540,20 @@ def check_shards(shard_dir=SHARD_DIR, dim=DIM):
             print(f"{name}: {reason}")
 
     if empty:
-        print("\n--- EMPTY SHARDS ---")
+        print("\n--- EMPTY SHARDS (every image in the chunk failed; see failed.jsonl) ---")
         for name in empty:
+            print(name)
+
+    if duplicates:
+        print("\n--- DUPLICATE IDS (first 20) ---")
+        for file_id, first, later in duplicates[:20]:
+            print(f"id {file_id}: in {first} and {later}")
+        if len(duplicates) > 20:
+            print(f"... and {len(duplicates) - 20} more")
+
+    if leftovers:
+        print("\n--- LEFTOVER TEMP FILES (crash leftovers, safe to delete) ---")
+        for name in leftovers:
             print(name)
 
     return {
@@ -413,14 +562,16 @@ def check_shards(shard_dir=SHARD_DIR, dim=DIM):
         "corrupted": corrupted,
         "invalid_shape": invalid_shape,
         "empty": empty,
+        "duplicates": duplicates,
+        "leftovers": leftovers,
     }
 
 def normalize_source(source):
     source = source.replace("\\", "/")
     return source if source.endswith("/") else source + "/"
 
-def scan_drive(source, out_file, err_file):
-    """Run exiftool over the drive. Returns exiftool's exit code."""
+def scan_path(source, out_file, err_file):
+    """Run exiftool over the path. Returns exiftool's exit code."""
     source = normalize_source(source)
     if not os.path.exists(source):
         raise FileNotFoundError(f"{source} not found, nothing scanned.")
@@ -840,20 +991,12 @@ def finished(candidate, last, out):
     if status == "ok":
         return bool(result.get("jpg")) and (out / result["jpg"]).exists()
 
-    if status == "unavailable" or (
-        status in ("failed", "too_small") and RETRY_FAILED
-    ):
+    if status == "unavailable" or (status in ("failed", "too_small") and RETRY_FAILED):
         return False
 
-    return True
+    return True 
 
-def extract_images(
-    database_url=DATABASE_URL,
-    fresh_start=FRESH_START,
-    out=OUT,
-    results=RESULTS,
-    fetch=FETCH,
-):
+def extract_images(database_url=DATABASE_URL,fresh_start=FRESH_START,out=OUT,results=RESULTS,fetch=FETCH):
     if not database_url:
         raise ValueError(
             "Set DATABASE_URL, for example:\n"
@@ -919,33 +1062,150 @@ def extract_images(
     print("This run:", counts or "nothing to do")
     print("Overall:", totals, "->", results)
 
-OUT = Path("jpegs_v2")
-RESULTS = Path("extract_results.jsonl")
+def upload_jpegs_to_s3(jpeg_dir=JPEG_DIR,bucket=BUCKET,prefix=PREFIX,region="ap-south-1",workers=16,skip_existing=True):
+    jpeg_dir = Path(jpeg_dir)
 
-MAX_SIDE = 1600
-QUALITY = 90
-MIN_NONRAW_SIDE = 512
-THUMB_MIN_SIDE = 1200
-WORKERS = 4
-FETCH = "all"  # "all" or "unembedded"
+    if not jpeg_dir.is_dir():
+        raise FileNotFoundError(f"{jpeg_dir} does not exist")
 
-RETRY_FAILED = False
-FRESH_START = False
+    session = boto3.Session(region_name=region)
 
-RAW_EXTS = {".cr2", ".cr3"}
-ROT = {3: 180, 5: 90, 6: -90}
+    s3 = session.client(
+        "s3",
+        config=Config(
+            max_pool_connections=workers + 5,
+            retries={"max_attempts": 5, "mode": "adaptive"},
+        ),
+    )
 
-Image.MAX_IMAGE_PIXELS = None  # trusted local files
+    transfer_config = TransferConfig(
+        multipart_threshold=16 * 1024 * 1024,
+        multipart_chunksize=16 * 1024 * 1024,
+        max_concurrency=4,
+        use_threads=True,
+    )
+
+    # Collect JPEGs
+    files = [
+        p for p in jpeg_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg")
+    ]
+
+    print(f"Found {len(files):,} JPEGs")
+
+    # Discover existing S3 objects
+    existing = set()
+
+    if skip_existing:
+        print("Fetching existing S3 objects...")
+
+        paginator = s3.get_paginator("list_objects_v2")
+
+        for page in paginator.paginate(
+            Bucket=bucket,
+            Prefix=f"{prefix}/" if prefix else "",
+        ):
+            for obj in page.get("Contents", []):
+                existing.add(obj["Key"])
+
+        print(f"Found {len(existing):,} existing objects")
+
+    # Prepare upload tasks
+    tasks = []
+
+    for path in files:
+        key = f"{prefix}/{path.name}" if prefix else path.name
+
+        if key in existing:
+            continue
+
+        tasks.append((path, key))
+
+    print(f"Remaining uploads: {len(tasks):,}")
+
+    uploaded = 0
+    failed = []
+    start = time.time()
+
+    def upload_one(path, key):
+        s3.upload_file(
+            str(path),
+            bucket,
+            key,
+            Config=transfer_config,
+            ExtraArgs={"ContentType": "image/jpeg"},
+        )
+        return path.name
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+
+        futures = {
+            executor.submit(upload_one, path, key): (path, key)
+            for path, key in tasks
+        }
+
+        for future in as_completed(futures):
+            path, key = futures[future]
+
+            try:
+                future.result()
+                uploaded += 1
+
+            except Exception as e:
+                failed.append({
+                    "file": str(path),
+                    "key": key,
+                    "error": repr(e),
+                })
+     
+            completed = uploaded + len(failed)
+
+            if completed % 100 == 0 or completed == len(tasks):
+                elapsed = time.time() - start
+                rate = completed / elapsed if elapsed else 0
+                remaining = len(tasks) - completed
+                eta = remaining / rate / 60 if rate else 0
+
+                print(
+                    f"{completed:,}/{len(tasks):,} | "
+                    f"uploaded {uploaded:,} | "
+                    f"failed {len(failed):,} | "
+                    f"{rate:.1f} files/s | ETA {eta:.1f} min",
+                    flush=True,
+                )
+
+    if failed:
+        import json
+        Path("s3_upload_failed.json").write_text(
+            json.dumps(failed, indent=2),
+            encoding="utf-8",
+        )
+
+    print("\nUpload complete")
+    print(f"Uploaded: {uploaded:,}")
+    print(f"Skipped: {len(files) - len(tasks):,}")
+    print(f"Failed: {len(failed):,}")
+
+    return {
+        "uploaded": uploaded,
+        "skipped": len(files) - len(tasks),
+        "failed": failed,
+    }
+
+def do_nothing(*args, **kwargs):
+    print("Doing nothing. Use --all or specify a step to run.")
 
 # order here = order they run in
 STEPS = {
-    "scan": scan_drive,
+    "scan": scan_path,
     "store": store_scan,
     "extract": extract_images,
     "gen": generate_embeddings,
     "check_s": check_shards,
     "merge_s": merge_shards,
     "test": test_search,
+    "do_nothing": do_nothing,
+    "upload": upload_jpegs_to_s3,
 }
 
 def main(argv=None):
@@ -980,8 +1240,8 @@ def main(argv=None):
         print(f"\n=== performing {name} ===", flush=True)
         params = inspect.signature(STEPS[name]).parameters
         kwargs = {k: v for k, v in vars(args).items() if k in params and v is not None}
-        print(f"\n=== {name} completed ===", flush=True)
         STEPS[name](**kwargs)
+        print(f"\n=== {name} completed ===", flush=True)
     return 0
 
 if __name__ == "__main__":
