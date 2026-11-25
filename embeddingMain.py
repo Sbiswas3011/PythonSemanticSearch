@@ -570,7 +570,7 @@ def normalize_source(source):
     source = source.replace("\\", "/")
     return source if source.endswith("/") else source + "/"
 
-def scan_path(source, out_file, err_file):
+def scan_path(source, out_file="ids.txt", err_file="errors.txt"):
     """Run exiftool over the path. Returns exiftool's exit code."""
     source = normalize_source(source)
     if not os.path.exists(source):
