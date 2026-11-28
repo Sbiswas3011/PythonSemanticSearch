@@ -31,7 +31,7 @@ load_dotenv()
 
 MODEL_DIR = r"C:\Users\JAYANTA\Desktop\LLM_Work\models\embeddinggemma2"
 JPEG_DIR = Path(r"C:\Users\JAYANTA\Desktop\PythonCases\jpegs_v2")
-VECS_FILE = "embeddings_new.npz"
+VECS_FILE = "embeddingsv2.npz"
 RECORDS_FILE = "convert_results.jsonl"
 DATABASE_URL = os.getenv("DATABASE_URL")
 CHUNK = 128
@@ -39,7 +39,7 @@ DIM = 768
 BATCH = 8
 IMG_KWARGS = {"image": {"max_soft_tokens": 1120}}
 QUERY = "a flamingo flying alone"
-
+FETCH = "all" 
 NS = uuid.UUID("6f1c0d2e-0000-4000-8000-000000000001")  # never change this once used
 EXTENSIONS = ["jpg", "jpeg", "cr2", "cr3"]
 IGNORE_DIRS = ["$RECYCLE.BIN", "System Volume Information"]
@@ -111,7 +111,7 @@ def fetch_all_candidates(database_url):
     """One file per capture_key (largest), regardless of embedding."""
     return _fetch(database_url)
 
-def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATABASE_URL,vecs_file=VECS_FILE,chunk_size=CHUNK,batch_size=BATCH,dim=DIM,shard_dir=SHARD_DIR,overwrite=False):
+def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATABASE_URL,vecs_file=VECS_FILE,chunk_size=CHUNK,batch_size=BATCH,dim=DIM,shard_dir=SHARD_DIR,fetch="unembedded",overwrite=True):
 
     #TODO: handle case of interrupted failed logs not printing
     #TODO: handle capture key as well in shards
@@ -138,8 +138,8 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
                 removed += 1
 
         # Remove old merged output and failure log
-        vecs_file.unlink(missing_ok=True)
-        Path("failed.json").unlink(missing_ok=True)
+        # vecs_file.unlink(missing_ok=True)
+        # Path("failed.json").unlink(missing_ok=True)
 
         print(f"overwrite: removed {removed} old shard files")
 
@@ -159,7 +159,11 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
     print("device:", model.device, "| dtype:", dtype)
 
      # 2. Fetch files from DB and match their extracted JPEGs
-    candidates = fetch_all_candidates(database_url)
+    candidates = []
+    if fetch == "unembedded":
+        candidates = fetch_unembedded_candidates(database_url)
+    elif fetch == "all":
+        candidates = fetch_all_candidates(database_url)
 
     records = []
 
@@ -197,7 +201,7 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
 
         chunk = records[start:start + chunk_size]
 
-        images, ok_ids = [], []
+        images, ok_ids, ok_capture_keys = [], [], []
 
         for r in chunk:
             try:
@@ -205,6 +209,7 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
                     images.append(im.convert("RGB"))
 
                 ok_ids.append(r["id"])
+                ok_capture_keys.append(r["capture_key"])
 
             except Exception as e:
                 failed.append((r["id"], repr(e)))
@@ -226,7 +231,7 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
 
         # Write to a temporary file before replacing the final shard
         tmp = shard.with_suffix(".tmp.npz")
-        np.savez(tmp, ids=np.array(ok_ids), vectors=vecs)
+        np.savez(tmp, ids=np.array(ok_ids), capture_keys=np.array(ok_capture_keys), vectors=vecs)
         tmp.replace(shard)
 
         done_this_run += len(chunk)
@@ -253,7 +258,7 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
         print(len(failed), "images failed, see failed.json")
 
     # 5. Merge existing shards
-    merge_shards(
+    merge_shards_v2(
         shard_dir=shard_dir,
         vecs_file=vecs_file,
         database_url=database_url,
@@ -265,7 +270,7 @@ def generate_embeddings(model_dir=MODEL_DIR,jpeg_dir=JPEG_DIR,database_url=DATAB
 
 def _hits_from_file(q, vecs_file, top_k):
     data = np.load(vecs_file, allow_pickle=False)
-    ids, vecs = data["ids"], data["vectors"]
+    ids, capture_keys, vecs = data["ids"], data["capture_keys"], data["vectors"]
     scores = (vecs @ q) / (np.linalg.norm(vecs, axis=1) * np.linalg.norm(q))
     order = scores.argsort()[::-1][:top_k]
     return [(ids[i].item(), float(scores[i])) for i in order]
@@ -361,10 +366,7 @@ def test_search(model_dir=MODEL_DIR, jpeg_dir=JPEG_DIR, vecs_file=VECS_FILE, dat
         file_keys = {h[2] for h in results["file"]}
         print(f"\noverlap in top {top_k}: {len(db_keys & file_keys)}/{top_k}")
 
-def merge_shards(shard_dir=SHARD_DIR, vecs_file=VECS_FILE, database_url=DATABASE_URL, dim=DIM, to_db=True):
-
-    #TODO: handle capture key as well in shards maybe using a db call to recitfy current
-
+def merge_shards_v2(shard_dir=SHARD_DIR,vecs_file=VECS_FILE,database_url=DATABASE_URL,dim=DIM,to_db=True):
     # 0. Prepare paths
     shard_dir = Path(shard_dir)
     vecs_file = Path(vecs_file)
@@ -375,9 +377,11 @@ def merge_shards(shard_dir=SHARD_DIR, vecs_file=VECS_FILE, database_url=DATABASE
     vecs_file.parent.mkdir(parents=True, exist_ok=True)
 
     if to_db and not database_url:
-        raise ValueError("Provide --database-url or set DATABASE_URL (or use to_db=False)")
+        raise ValueError(
+            "Provide --database-url or set DATABASE_URL (or use to_db=False)"
+        )
 
-    # 1. Collect shards, skipping leftover temp files from crashes
+    # 1. Collect shards
     shards = sorted(
         p for p in shard_dir.glob("shard_*.npz")
         if not p.name.endswith(".tmp.npz")
@@ -387,49 +391,101 @@ def merge_shards(shard_dir=SHARD_DIR, vecs_file=VECS_FILE, database_url=DATABASE
         print("No shards found.")
         return
 
-    # 2. Load and validate
-    ids, vecs = [], []
+    # 2. Load existing merged embeddings
+    ids, capture_keys, vecs = [], [], []
 
+    if vecs_file.is_file():
+        with np.load(vecs_file, allow_pickle=False) as p:
+            old_ids = p["ids"].copy()
+            old_capture_keys = p["capture_keys"].copy()
+            old_vecs = p["vectors"].copy()
+
+        if old_vecs.shape != (len(old_ids), dim):
+            raise ValueError(
+                f"Existing vecs_file has invalid vector shape: {old_vecs.shape}"
+            )
+
+        if len(old_capture_keys) != len(old_ids):
+            raise ValueError("Existing vecs_file has misaligned capture_keys.")
+
+        if len(old_ids):
+            ids.append(old_ids)
+            capture_keys.append(old_capture_keys)
+            vecs.append(old_vecs.astype(np.float32))
+
+        print(f"Loaded {len(old_ids):,} existing embeddings")
+
+    # 3. Load new shards
     for shard in shards:
         with np.load(shard, allow_pickle=False) as p:
             s_ids = p["ids"].copy()
+            s_capture_keys = p["capture_keys"].copy()
             s_vecs = p["vectors"].copy()
 
         if s_vecs.shape != (len(s_ids), dim):
-            raise ValueError(f"{shard.name}: ids {len(s_ids)}, vectors {s_vecs.shape}, expected dim {dim}")
+            raise ValueError(
+                f"{shard.name}: ids {len(s_ids)}, vectors {s_vecs.shape}, "
+                f"expected dim {dim}"
+            )
+
+        if len(s_capture_keys) != len(s_ids):
+            raise ValueError(
+                f"{shard.name}: ids {len(s_ids)}, "
+                f"capture_keys {len(s_capture_keys)}"
+            )
 
         if len(s_ids):
             ids.append(s_ids)
+            capture_keys.append(s_capture_keys)
             vecs.append(s_vecs.astype(np.float32))
 
     if not ids:
-        print("All shards are empty.")
+        print("No embeddings to merge.")
         return
 
     all_ids = np.concatenate(ids)
+    all_capture_keys = np.concatenate(capture_keys)
     all_vecs = np.concatenate(vecs)
 
-    # 3. Dedupe by id, keeping the LAST occurrence (newest shard wins)
+    # 4. Deduplicate by ID, keeping the LAST occurrence
     latest = {}
+
     for pos, file_id in enumerate(all_ids.tolist()):
-        latest[file_id] = pos          # later positions overwrite earlier ones
+        latest[file_id] = pos
 
     if len(latest) != len(all_ids):
-        print(f"dropped {len(all_ids) - len(latest)} duplicate ids")
+        print(f"Dropped {len(all_ids) - len(latest):,} duplicate IDs")
+
         keep = sorted(latest.values())
-        all_ids, all_vecs = all_ids[keep], all_vecs[keep]
 
-    all_vecs /= np.linalg.norm(all_vecs, axis=1, keepdims=True)
+        all_ids = all_ids[keep]
+        all_capture_keys = all_capture_keys[keep]
+        all_vecs = all_vecs[keep]
 
-    # 4. Write the merged file atomically
+    # 5. Normalize vectors
+    norms = np.linalg.norm(all_vecs, axis=1, keepdims=True)
+
+    if np.any(norms == 0):
+        raise ValueError("Zero-norm embeddings found.")
+
+    all_vecs /= norms
+
+    # 6. Write merged NPZ atomically
     tmp = vecs_file.with_name(vecs_file.name + ".tmp.npz")
+
     with open(tmp, "wb") as f:
-        np.savez(f, ids=all_ids, vectors=all_vecs)
+        np.savez(
+            f,
+            ids=all_ids,
+            capture_keys=all_capture_keys,
+            vectors=all_vecs
+        )
+
     tmp.replace(vecs_file)
 
     print(f"Saved {len(all_ids):,} embeddings to {vecs_file}")
 
-    # 5. Write to the database (representative + all siblings sharing its capture_key)
+    # 7. Update database
     if not to_db:
         return
 
@@ -437,22 +493,32 @@ def merge_shards(shard_dir=SHARD_DIR, vecs_file=VECS_FILE, database_url=DATABASE
         UPDATE files
         SET embedding = %s,
             contrastive_embedding = %s
-        WHERE capture_key = (SELECT capture_key FROM files WHERE id = %s)
+        WHERE capture_key = %s
     """
-
-    id_list = all_ids.tolist()   # numpy ints/strings -> plain Python values
 
     with psycopg.connect(database_url) as conn:
         register_vector(conn)
+
         with conn.cursor() as cur:
-            for start in range(0, len(id_list), 1000):
-                end = start + 1000
+            for start in range(0, len(all_ids), 1000):
+                end = min(start + 1000, len(all_ids))
+
                 cur.executemany(
                     sql,
-                    [(all_vecs[i], all_vecs[i], id_list[i]) for i in range(start, min(end, len(id_list)))],
+                    [
+                        (
+                            all_vecs[i],
+                            all_vecs[i],
+                            str(all_capture_keys[i]) or None
+                        )
+                        for i in range(start, end)
+                        if str(all_capture_keys[i])
+                    ]
                 )
+
                 conn.commit()
-                print(f"DB: {min(end, len(id_list)):,}/{len(id_list):,}", flush=True)
+
+                print(f"DB: {end:,}/{len(all_ids):,}", flush=True)
 
     print("Database updated.")
 
@@ -586,6 +652,142 @@ def scan_path(source, out_file="ids.txt", err_file="errors.txt"):
     with open(out_file, "wb") as out, open(err_file, "wb") as err:
         return subprocess.run(cmd, stdout=out, stderr=err).returncode
 
+def scan_path_v2(source, out_file="ids.txt", err_file="errors.txt"):
+    source = Path(normalize_source(source)).resolve()
+
+    if not source.is_dir():
+        raise FileNotFoundError(f"{source} not found or not a directory.")
+
+    out_file = Path(out_file)
+    err_file = Path(err_file)
+
+    # Persistent working directory
+    work_dir = Path(str(out_file) + ".scan")
+    shard_dir = work_dir / "shards"
+    error_dir = work_dir / "errors"
+
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    error_dir.mkdir(parents=True, exist_ok=True)
+
+    # Prevent accidentally resuming a different source
+    meta_file = work_dir / "meta.json"
+
+    config = {
+        "source": str(source),
+        "extensions": EXTENSIONS,
+        "fields": FIELDS,
+        "ignore_dirs": IGNORE_DIRS,
+    }
+
+    if meta_file.exists():
+        old_config = json.loads(meta_file.read_text())
+
+        if old_config != config:
+            raise ValueError(
+                "Scan configuration differs from previous run. "
+                "Use a new output filename or clear the old scan directory."
+            )
+    else:
+        meta_file.write_text(json.dumps(config, indent=2))
+
+    # 1. Enumerate directories
+    directories = []
+
+    for root, dirs, files in os.walk(source):
+        # Prune ignored directories
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in IGNORE_DIRS
+        )
+
+        directories.append(Path(root))
+
+    total = len(directories)
+    completed = 0
+    failed = []
+
+    print(f"Found {total:,} directories.")
+
+    # 2. Process each directory
+    for index, directory in enumerate(directories, 1):
+
+        relative = directory.relative_to(source).as_posix()
+
+        # Stable ID for this directory
+        directory_id = hashlib.sha256(
+            relative.encode("utf-8")
+        ).hexdigest()
+
+        shard = shard_dir / f"{directory_id}.txt"
+        error_file_dir = error_dir / f"{directory_id}.txt"
+
+        # Already processed successfully
+        if shard.exists():
+            completed += 1
+            continue
+
+        tmp = shard.with_suffix(".tmp")
+
+        cmd = ["exiftool", "-fast"]
+
+        for ext in EXTENSIONS:
+            cmd += ["-ext", ext]
+
+        cmd += ["-q", "-f", "-p", "|".join(FIELDS), str(directory)]
+
+        try:
+            with open(tmp, "wb") as out, open(error_file_dir, "wb") as err:
+                result = subprocess.run(
+                    cmd,
+                    stdout=out,
+                    stderr=err
+                )
+
+            if result.returncode == 0:
+                # Atomic checkpoint
+                tmp.replace(shard)
+                completed += 1
+            else:
+                tmp.unlink(missing_ok=True)
+                failed.append(str(directory))
+
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            failed.append(str(directory))
+            print(f"\nError scanning {directory}: {e}")
+
+        if index % 100 == 0 or index == total:
+            print(
+                f"{index:,}/{total:,} directories | "
+                f"{completed:,} completed | "
+                f"{len(failed):,} failed",
+                flush=True
+            )
+
+    # 3. Merge all completed shards
+    tmp_output = out_file.with_suffix(out_file.suffix + ".tmp")
+
+    with open(tmp_output, "wb") as merged:
+        for shard in sorted(shard_dir.glob("*.txt")):
+            with open(shard, "rb") as f:
+                while chunk := f.read(1024 * 1024):
+                    merged.write(chunk)
+
+    tmp_output.replace(out_file)
+
+    # 4. Merge error logs
+    with open(err_file, "wb") as merged:
+        for error in sorted(error_dir.glob("*.txt")):
+            with open(error, "rb") as f:
+                merged.write(f.read())
+
+    print(f"\nScan complete.")
+    print(f"Completed: {completed:,}/{total:,}")
+    print(f"Failed: {len(failed):,}")
+    print(f"Output: {out_file}")
+
+    return 0 if not failed else 1
+
 def clean(value):
     """Convert ExifTool's missing-value markers into None."""
     value = value.strip().strip("*")
@@ -610,28 +812,25 @@ def load_embedding_lookup(npz_path):
 
     data = np.load(npz_path, allow_pickle=True)
 
-    ids = data["ids"]
+    capture_keys = data["capture_keys"]
     vectors = data["vectors"]
 
     lookup = {}
 
-    for i, value in enumerate(ids):
-        parts = str(value).rsplit("__", 1)
-        if len(parts) != 2:
+    for i, capture_key in enumerate(capture_keys):
+        capture_key = str(capture_key)
+
+        if not capture_key:
             continue
 
-        filename, size = parts
-
-        try:
-            key = (filename, int(size))
-        except ValueError:
-            continue
-
-        lookup[key] = np.asarray(vectors[i], dtype=np.float32)
+        lookup[capture_key] = np.asarray(vectors[i], dtype=np.float32)
 
     return lookup
 
 def store_scan(source, vecs_file=VECS_FILE, database_url=DATABASE_URL):
+
+    #TODO: handle the case of repeated scan by getting paths from db and populating a dictionary to avoid reprocessing them
+
     if not database_url:
         raise ValueError("Provide --database-url or set DATABASE_URL")
 
@@ -749,10 +948,8 @@ def store_scan(source, vecs_file=VECS_FILE, database_url=DATABASE_URL):
 
                     tracking = capture_key is not None
 
-                    # Match using filename + actual filesystem size
-                    embedding = embedding_lookup.get(
-                        (filename, stat.st_size)
-                    )
+                    # Match using capture_key
+                    embedding = embedding_lookup.get(capture_key)
 
                     if embedding is not None:
                         embedding = np.asarray(
@@ -818,7 +1015,6 @@ QUALITY = 90
 MIN_NONRAW_SIDE = 512
 THUMB_MIN_SIDE = 1200
 WORKERS = 4
-FETCH = "all"  # "all" or "unembedded"
 
 RETRY_FAILED = False
 FRESH_START = False
@@ -1202,10 +1398,10 @@ STEPS = {
     "extract": extract_images,
     "gen": generate_embeddings,
     "check_s": check_shards,
-    "merge_s": merge_shards,
+    "merge_s": merge_shards_v2,
     "test": test_search,
-    "do_nothing": do_nothing,
     "upload": upload_jpegs_to_s3,
+    "do_nothing": do_nothing,
 }
 
 def main(argv=None):
